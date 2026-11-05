@@ -13,7 +13,7 @@ The prerequisites required by different enforcers are as shown in the following 
 |AppArmor    |1. Linux Kernel 4.15+<br />2. The AppArmor LSM is enabled|GKE with Container-Optimized OS<br />AKS with Ubuntu<br />[VKE](https://www.volcengine.com/product/vke) with veLinux<br />Debian 10 and above<br />Ubuntu 18.04.0 LTS and above<br />[veLinux](https://www.volcengine.com/docs/6396/74967) etc.
 |BPF         |1. Linux Kernel 5.10+ (x86_64) or 6.6+ (arm64)<br />2. containerd v1.6.0+<br />3. The BPF LSM is enabled|EKS with Amazon Linux 2<br />GKE with Container-Optimized OS<br />[VKE](https://www.volcengine.com/product/vke) with veLinux (with 5.10 kernel)<br />AKS with Ubuntu 22.04 LTS <sup>\*</sup><br />ACK with Alibaba Cloud Linux 3 <sup>\*</sup><br />OpenSUSE 15.4 <sup>\*</sup><br />Debian 11 <sup>\*</sup><br />Fedora 37 <br />[veLinux (with 5.10 kernel)](https://www.volcengine.com/docs/6396/74967) etc.<br /><br />* *Manual enabling of BPF LSM is required*
 |Seccomp     |1. Kubernetes v1.19+|All Linux distributions
-|NetworkProxy|-|All Linux distributions
+|NetworkProxy|Workload namespaces permit injected proxy containers to start as root and init containers to use NET_ADMIN|See [security and compatibility](../guides/enforcers/networkproxy/security-and-compatibility.md)|
 
 ## Installation
 
@@ -22,13 +22,13 @@ vArmor can be deployed via a Helm chart which is the recommended and preferred m
 In order to install vArmor with Helm, first fetch the chart.
 
 ```
-helm pull oci://elkeid-ap-southeast-1.cr.volces.com/varmor/varmor --version 0.10.3
+helm pull oci://elkeid-ap-southeast-1.cr.volces.com/varmor/varmor --version 0.10.6
 ```
 
 Then install it with helm optional [configurations](#configuration).
 
 ```
-helm install varmor varmor-0.10.3.tgz \
+helm install varmor varmor-0.10.6.tgz \
     --namespace varmor --create-namespace \
     --set image.registry="elkeid-ap-southeast-1.cr.volces.com"
 ```
@@ -156,12 +156,61 @@ You can use the following option to change this behavior. Default: disabled.
 ```
 
 
+### Dynamic Configuration
+
+Besides the install-time Helm options above, vArmor ships a runtime-reloadable configuration carried by the `varmor-config` ConfigMap in vArmor's namespace. The manager watches this ConfigMap via an informer and hot-reloads changes **without a restart**. If the ConfigMap is absent or malformed, the manager falls back to the built-in defaults (which are identical to the values shipped by the chart). You can seed its initial content through the `dynamicConfig` value at install time, or edit the ConfigMap directly afterwards.
+
+```bash
+kubectl -n varmor edit configmap varmor-config
+```
+
+#### Default Resources of the NetworkProxy Sidecar
+You can set the cluster-wide default resource requests/limits for the injected NetworkProxy (Envoy) sidecar, so an administrator can tune sidecar resources once instead of setting `.spec.policy.networkProxyConfig.resources` on every policy.
+
+The injector resolves the final resources with a three-layer, field-level merge chain, where each leaf value (`requests.cpu`/`requests.memory`/`limits.cpu`/`limits.memory`) falls back independently:
+
+> per-policy override (`.spec.policy.networkProxyConfig.resources`) > this cluster-global config > built-in defaults
+
+Two independent, MITM-aware tiers are provided, because a MITM sidecar runs heavier (double TLS handshakes). A MITM sidecar reads **only** the `mitm` tier and a non-MITM sidecar reads **only** the `nonMitm` tier — the tiers are **not** inherited from each other. The built-in defaults are:
+
+| Tier | CPU requests | Memory requests | CPU limits | Memory limits |
+|------|-------------|----------------|-----------|--------------|
+| `nonMitm` | 50m | 64Mi | 500m | 256Mi |
+| `mitm` | 100m | 128Mi | 1000m | 512Mi |
+
+```bash
+--set dynamicConfig.networkProxy.defaultResources.nonMitm.requests.cpu="50m" \
+--set dynamicConfig.networkProxy.defaultResources.nonMitm.requests.memory="64Mi" \
+--set dynamicConfig.networkProxy.defaultResources.mitm.limits.cpu="1000m" \
+--set dynamicConfig.networkProxy.defaultResources.mitm.limits.memory="512Mi"
+```
+
+Notes:
+* Always quote quantities as strings (e.g. `"500m"`, `"256Mi"`). An unquoted bare number is parsed as an integer, so `memory: 100` means **100 bytes**, not 100Mi.
+* The tier keys must be spelled exactly `nonMitm` and `mitm`. A misspelled tier key is silently ignored and that tier falls back to the built-in defaults.
+* Invalid entries (an unknown resource name, an unparseable quantity, a non-positive value, or a limit set below its request in the same tier) are ignored and logged by the manager at load time; that field falls back to its built-in default.
+
+#### Micro-VM (Kata) Detection for NetworkProxy Auditing
+With runc, NetworkProxy audit logs are recorded on the workload’s node. With Kata or another configured micro-VM runtime, logs are recorded inside the proxy sidecar. Both use `/var/log/varmor/violations.log`. Configure runtime detection below so vArmor can choose the appropriate volume mounts. See [Observability](../guides/enforcers/networkproxy/observability.md) for log access.
+
+The `microVMDetection` config tells the injector which workloads run under a micro-VM runtime. A workload matches if its `runtimeClassName` is listed **OR** any annotation rule matches **OR** any label rule matches (for annotation/label rules, an empty value matches on key presence alone; a non-empty value must match exactly). The built-in defaults already cover upstream kata and the major cloud serverless runtimes:
+
+* `runtimeClassNames`: `kata`, `kata-qemu`, `kata-clh`
+* annotation: `vke.volcengine.com/burst-to-vci=enforce` (Volcengine VKE burst-to-VCI)
+* label: `alibabacloud.com/eci=true` (Alibaba Cloud ECI)
+
+To extend the rules for a custom micro-VM runtime, edit the `varmor-config` ConfigMap or set the `dynamicConfig.microVMDetection` values at install time.
+
+#### iptables Backend for NetworkProxy Traffic Redirection
+The NetworkProxy enforcer transparently redirects traffic by injecting iptables rules through an init container. Starting from the `proxyinit:v0.2` image, vArmor automatically detects the iptables backend (`legacy` vs `nft`) already in use in the target network namespace and drives the matching backend, instead of hardcoding one. This prevents traffic from being silently blackholed in shared-netns setups — for example a kata Pod whose netns is also programmed by a PaaS mesh init using the `legacy` backend. On a fresh netns it defaults to `nft` (matching prior behaviour); if both backends already carry rules it aborts with a `CONFLICT` rather than guessing. This is fully automatic and requires no configuration; just make sure the chart pulls `proxyinit:v0.2` or later.
+
+
 ## Upgrade
 
 You can use helm commands to upgrade, rollback, and perform other operations.
 
 ```bash
-helm upgrade varmor varmor-0.10.3.tgz \
+helm upgrade varmor varmor-0.10.6.tgz \
     --namespace varmor --create-namespace \
     --set image.registry="elkeid-ap-southeast-1.cr.volces.com" \
     --set bpfLsmEnforcer.enabled=true \

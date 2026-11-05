@@ -16,6 +16,7 @@ package profile
 
 import (
 	"fmt"
+	"net"
 	"strings"
 
 	varmor "github.com/bytedance/vArmor/apis/varmor/v1beta1"
@@ -40,13 +41,9 @@ type FilterChain struct {
 // DownstreamTLSContext is a minimal representation of Envoy's
 // envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext.
 //
-// The translator only produces file-backed tls_certificates because the
-// controller writes the leaf cert/key into the policy's unified Secret
-// and projects them into the sidecar at fixed paths; Envoy's
-// watched_directory picks up rotations in place.
+// Certificate material is loaded through a file-based dynamic TLS secret.
 type DownstreamTLSContext struct {
-	CertPath string
-	KeyPath  string
+	SecretPath string
 }
 
 // FilterChainMatch defines the match criteria for a filter chain.
@@ -58,9 +55,9 @@ type FilterChainMatch struct {
 	// MITMConfig.Domains. Literal entries and single-label wildcards
 	// (e.g., "*.openai.com") are supported by Envoy natively.
 	ServerNames []string
-	// PrefixRanges is the destination-IP CIDR match list, used by MITM
-	// IP chains to intercept plain-IP TLS connections (no SNI) whose
-	// destination appears in MITMConfig.Domains as an IP literal.
+	// PrefixRanges constrains the destination IP. MITM IP targets use
+	// identical prefixes for their IP TLS, plaintext HTTP and DNS TLS
+	// candidates so Envoy can select each protocol within that IP branch.
 	PrefixRanges []string
 }
 
@@ -157,6 +154,9 @@ type HTTPConnManagerConfig struct {
 type RouteConfig struct {
 	Name         string
 	VirtualHosts []VirtualHost
+	// IgnorePortInHostMatching selects a virtual host by hostname without
+	// rewriting the forwarded authority or changing RBAC port checks.
+	IgnorePortInHostMatching bool
 }
 
 type VirtualHost struct {
@@ -330,8 +330,8 @@ func (a *AuditConfig) HasShadowHTTPRules() bool {
 // ============================================================================
 
 // computeListenerCELs returns the deny and shadow CEL expressions for listener-level access_log.
-// Each is returned separately so the renderer can emit them as independent access_log entries,
-// avoiding the CEL || short-circuit failure when connection.termination_details is null.
+// Return conditions separately so the renderer can use independent CEL filters
+// under an OrFilter, isolating errors when a connection attribute is absent.
 func computeListenerCELs(defaultDeny bool, hasShadowEgressRules bool) (denyCEL, shadowCEL string) {
 	if defaultDeny {
 		denyCEL = celListenerDeny
@@ -343,8 +343,8 @@ func computeListenerCELs(defaultDeny bool, hasShadowEgressRules bool) (denyCEL, 
 }
 
 // computeHCMCELs returns the deny and shadow CEL expressions for HCM-level access_log.
-// Each is returned separately so the renderer can emit them as independent access_log entries,
-// avoiding the CEL || short-circuit failure.
+// Return conditions separately so the renderer can use independent CEL filters
+// under an OrFilter, isolating errors when metadata is absent.
 func computeHCMCELs(defaultDeny bool, hasShadowRules bool) (denyCEL, shadowCEL string) {
 	if defaultDeny {
 		denyCEL = celHCMDeny
@@ -370,9 +370,9 @@ type TranslateResult struct {
 // The optional mitm argument enables TLS MITM + HTTP header injection.
 // When mitm is nil or MITMInput.Enabled() reports false, the emitted
 // listener is identical to the pre-Phase-4 output (three filter chains:
-// TLS passthrough, HTTP, TCP default). When enabled, one or two MITM
-// filter chains are prepended so Envoy's most-specific-match precedence
-// intercepts targeted TLS while other TLS falls through unchanged.
+// TLS passthrough, HTTP, TCP default). MITM adds scoped TLS chains and,
+// for IP targets, matching HTTP/DNS candidates within the IP-specific branch.
+// Selection follows Envoy's specificity rules, not list order.
 func TranslateEgressRules(egress *varmor.NetworkProxyEgress, version int64, proxyPort uint16, mitm *MITMInput, ipStack IPStackConfig, audit AuditSinkConfig) (*TranslateResult, error) {
 	if egress == nil {
 		return nil, fmt.Errorf("network proxy egress rules is nil")
@@ -601,8 +601,17 @@ func buildHTTPChain(defaultDeny bool,
 	denyHTTPRules, allowHTTPRules []varmor.NetworkProxyHTTPRule,
 	auditCfg AuditConfig, audit AuditSinkConfig,
 ) FilterChain {
+	return buildHTTPChainWithName(FilterChainNameHTTP, defaultDeny, denyEgressRules, allowEgressRules,
+		denyHTTPRules, allowHTTPRules, auditCfg, audit)
+}
+
+func buildHTTPChainWithName(chainName string, defaultDeny bool,
+	denyEgressRules, allowEgressRules []varmor.NetworkProxyEgressRule,
+	denyHTTPRules, allowHTTPRules []varmor.NetworkProxyHTTPRule,
+	auditCfg AuditConfig, audit AuditSinkConfig,
+) FilterChain {
 	chain := FilterChain{
-		Name: FilterChainNameHTTP,
+		Name: chainName,
 		FilterChainMatch: &FilterChainMatch{
 			ApplicationProtocols: []string{"http/1.0", "http/1.1", "h2c"},
 		},
@@ -669,7 +678,7 @@ func buildHTTPChain(defaultDeny bool,
 			AccessLogDenyCEL:   hcmDenyCEL,
 			AccessLogShadowCEL: hcmShadowCEL,
 			AuditSink:          audit,
-			FilterChainName:    FilterChainNameHTTP,
+			FilterChainName:    chainName,
 			RouteConfig: &RouteConfig{
 				Name: "local_route",
 				VirtualHosts: []VirtualHost{{
@@ -939,12 +948,13 @@ func httpRuleToSNIPermissions(r varmor.NetworkProxyHTTPRule) []Permission {
 func httpRuleToHTTPPermissions(r varmor.NetworkProxyHTTPRule) []Permission {
 	// ── Phase 1: Build method & path dimensions (unchanged) ──────────
 	var methodRules []PermissionRule
+	// HTTP method tokens are case-sensitive; preserve the policy spelling.
 	for _, method := range r.Match.Methods {
 		methodRules = append(methodRules, PermissionRule{
 			Type: "header",
 			Value: map[string]string{
 				"name":        ":method",
-				"exact_match": strings.ToUpper(method),
+				"exact_match": method,
 			},
 		})
 	}
@@ -1081,60 +1091,56 @@ func isDefaultHTTPPort(port uint16) bool {
 	return port == 80 || port == 443
 }
 
-// authorityMatcherForHostPort returns a single PermissionRule that matches
-// the :authority header for the given (host, port) combination.
-//
-// For default ports (80, 443): :authority = "host" (no port suffix).
-// For non-default ports:       :authority = "host:port".
-//
-// This eliminates dead rules by binding the port into the matcher value.
+// ipv6HostLiteral recognizes a bare IPv6 HTTP host or exactly one pair of
+// enclosing brackets. It preserves the address spelling and does not accept
+// ports, zones, nested brackets or bracketed IPv4 addresses.
+func ipv6HostLiteral(host string) (string, bool) {
+	literal := host
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		literal = host[1 : len(host)-1]
+	}
+	// IPv4-mapped IPv6 literals also need brackets; do not use To4 here.
+	if strings.Contains(literal, ":") && net.ParseIP(literal) != nil {
+		return literal, true
+	}
+	return "", false
+}
+
+// httpAuthorityHost brackets IPv6 literals for HTTP host/port matching.
+// Keep the input spelling and leave DNS names, wildcards and IPv4 unchanged.
+func httpAuthorityHost(host string) string {
+	if literal, ok := ipv6HostLiteral(host); ok {
+		return "[" + literal + "]"
+	}
+	return host
+}
+
+// authorityMatcherForHostPort matches the :authority header for a host and port.
+// Default ports (80, 443) accept both "host" and "host:port". Non-default ports
+// require "host:port". IPv6 literals are bracketed; wildcard domains use suffixes.
+// The caller enforces the actual destination port in a separate AND condition.
 func authorityMatcherForHostPort(host string, port uint16) PermissionRule {
 	if isMatchAllHost(host) {
-		// Catch-all "*": match any :authority. The TCP port is enforced
-		// separately via the destination_port rule, so the authority
-		// matcher is match-any. A literal exact/prefix on "*" never matches.
+		// The actual destination port is still constrained by the caller.
 		return PermissionRule{Type: "any", Value: true}
 	}
+	kind, value := "exact_match", httpAuthorityHost(host)
 	if isWildcardDomain(host) {
-		suffix := wildcardToSuffix(host) // "*.openai.com" -> ".openai.com"
-		if isDefaultHTTPPort(port) {
-			return PermissionRule{
-				Type: "header",
-				Value: map[string]string{
-					"name":         ":authority",
-					"suffix_match": suffix,
-				},
-			}
-		}
-		// Non-default port: suffix includes ":port"
-		// e.g., ".openai.com:6443" matches "api.openai.com:6443"
-		return PermissionRule{
-			Type: "header",
-			Value: map[string]string{
-				"name":         ":authority",
-				"suffix_match": fmt.Sprintf("%s:%d", suffix, port),
-			},
-		}
+		kind, value = "suffix_match", wildcardToSuffix(host)
 	}
-
-	// Exact host
-	if isDefaultHTTPPort(port) {
-		return PermissionRule{
-			Type: "header",
-			Value: map[string]string{
-				"name":        ":authority",
-				"exact_match": host,
-			},
-		}
+	explicit := PermissionRule{
+		Type:  "header",
+		Value: map[string]string{"name": ":authority", kind: fmt.Sprintf("%s:%d", value, port)},
 	}
-	// Non-default port: bake "host:port" into exact_match
-	return PermissionRule{
-		Type: "header",
-		Value: map[string]string{
-			"name":        ":authority",
-			"exact_match": fmt.Sprintf("%s:%d", host, port),
-		},
+	if !isDefaultHTTPPort(port) {
+		return explicit
 	}
+	// Accept both legal default-port spellings without accepting arbitrary ports
+	// in the authority or weakening the separate destination_port constraint.
+	return PermissionRule{Type: "or_rules", Value: []PermissionRule{
+		{Type: "header", Value: map[string]string{"name": ":authority", kind: value}},
+		explicit,
+	}}
 }
 
 // portAgnosticHostRules generates :authority matchers that work regardless
@@ -1165,6 +1171,7 @@ func portAgnosticHostRules(hosts []string) []PermissionRule {
 			})
 		} else {
 			// or_rules wrapping exact + prefix, treated as atomic unit
+			host = httpAuthorityHost(host)
 			rules = append(rules, PermissionRule{
 				Type: "or_rules",
 				Value: []PermissionRule{
@@ -1216,9 +1223,9 @@ func portToPermissionRules(ports []varmor.Port) []PermissionRule {
 		if p.EndPort > 0 && p.EndPort != p.Port {
 			rules = append(rules, PermissionRule{
 				Type: "destination_port_range",
-				Value: map[string]uint16{
-					"start": p.Port,
-					"end":   p.EndPort + 1,
+				Value: map[string]uint32{
+					"start": uint32(p.Port),
+					"end":   uint32(p.EndPort) + 1,
 				},
 			})
 		} else {

@@ -17,11 +17,10 @@ package profile
 import (
 	"fmt"
 	"net"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-
-	varmorconfig "github.com/bytedance/vArmor/internal/config"
 )
 
 // ============================================================================
@@ -30,9 +29,9 @@ import (
 
 // --- CEL Expression Constants ---
 //
-// All access_log filtering uses CEL (Common Expression Language) exclusively.
-// This eliminates response_flag_filter (UAEX), metadata_filter, and or_filter,
-// providing a single, consistent mechanism across all layers.
+// Access-log predicates use CEL (Common Expression Language). When both deny
+// and shadow conditions are enabled, an OrFilter joins independent CEL filters.
+// No response_flag_filter (UAEX) or metadata_filter is used.
 //
 // Background: Envoy's RBAC filters do NOT set the UAEX response flag.
 // UAEX is only set by ext_authz. Network RBAC sets CONNECTION_TERMINATION_DETAILS,
@@ -61,12 +60,9 @@ const (
 	// HCM-level CEL: detect shadow_rules match (HTTP RBAC audit) via dynamic metadata.
 	celHCMShadow = `'shadow_effective_policy_id' in metadata.filter_metadata['envoy.filters.http.rbac']`
 
-	// NOTE: The "DenyOrShadow" combined constants have been intentionally removed.
-	// Envoy's CEL evaluator does NOT properly short-circuit "error || true":
-	// when connection.termination_details is null (allow path), .matches()
-	// produces a CEL error that poisons the entire || expression, preventing
-	// the shadow side from being evaluated. Instead, deny and shadow CEL are
-	// rendered as SEPARATE access_log entries.
+	// Keep each condition in its own CEL filter: a missing attribute should
+	// make only that condition false. OrFilter combines their results in a
+	// single access logger without duplicate emission on overlapping matches.
 )
 
 // yamlCEL wraps a CEL expression for safe embedding in YAML.
@@ -174,34 +170,17 @@ resources:
       "@type": type.googleapis.com/envoy.extensions.filters.listener.http_inspector.v3.HttpInspector
 `)
 
-	// Listener-level access_log: captures connection-level events across ALL filter chains
-	// (TLS chain + TCP default chain). Uses CEL to detect Network RBAC deny events
-	// and/or shadow_rules metadata matches.
-	//
-	// IMPORTANT: deny and shadow CEL are rendered as SEPARATE access_log entries
-	// (not combined with ||) because Envoy CEL short-circuit evaluation fails when
-	// connection.termination_details is null (allow path): the .matches() call
-	// produces a CEL error that poisons the entire || expression, preventing the
-	// shadow side from being evaluated.
-	//
-	// HTTP chain events are handled separately at the HCM level, so there is no
-	// namespace conflict between envoy.filters.network.rbac and envoy.filters.http.rbac.
+	// Network RBAC logging is shared by TLS passthrough and TCP chains.
+	// HTTP RBAC logging uses the HCM's separate metadata namespace.
 	if listenerAccessLogEnabled && (listenerDenyCEL != "" || listenerShadowCEL != "") {
 		sb.WriteString("\n  access_log:\n")
-		if listenerDenyCEL != "" {
-			renderALSAccessLogEntry(&sb, "  ", listenerDenyCEL, audit.denyLogName(), audit.clusterName(), "", false, audit.ALSBufferFlushInterval, audit.ALSBufferSizeBytes)
-		}
-		if listenerShadowCEL != "" {
-			renderALSAccessLogEntry(&sb, "  ", listenerShadowCEL, audit.auditLogName(), audit.clusterName(), "", false, audit.ALSBufferFlushInterval, audit.ALSBufferSizeBytes)
-		}
+		renderALSAccessLogEntry(&sb, "  ", listenerDenyCEL, listenerShadowCEL, audit.eventLogName(), audit.clusterName(), "", false, audit.ALSBufferFlushInterval, audit.ALSBufferSizeBytes)
 	}
 
 	sb.WriteString("\n  filter_chains:\n")
 
-	// MITM chains (optional): listed BEFORE the Phase 1 TLS chain so that
-	// Envoy's most-specific filter_chain_match precedence picks them up
-	// when server_names or prefix_ranges match, while other TLS traffic
-	// falls through to the passthrough TLS chain below.
+	// Optional MITM chains and their IP-specific HTTP/DNS candidates.
+	// Envoy selects by match specificity, independently of list order.
 	for i := range mitmChains {
 		sb.WriteString(renderFilterChainYAML(&mitmChains[i], 2))
 	}
@@ -287,11 +266,17 @@ func renderFilterChainYAML(chain *FilterChain, indent int) string {
 
 // cidrToPrefixRange parses an IPv4/IPv6 CIDR or bare IP string into the
 // (address_prefix, prefix_len) pair required by Envoy's
-// filter_chain_match.prefix_ranges. A bare IPv4 becomes /32, a bare IPv6
-// becomes /128.
+// filter-chain prefix ranges and RBAC destination IPs. A bare IPv4 becomes
+// /32, a bare IPv6 becomes /128. Mapped IPv6 subnets within ::ffff:0:0/96
+// become equivalent IPv4 subnets, with the prefix length reduced by 96.
 func cidrToPrefixRange(cidr string) (string, int) {
 	if ip, ipNet, err := net.ParseCIDR(cidr); err == nil {
-		ones, _ := ipNet.Mask.Size()
+		ones, bits := ipNet.Mask.Size()
+		// IP.String renders mapped addresses as IPv4. Convert the mask too,
+		// but keep wider IPv6 ranges in their original address family.
+		if bits == net.IPv6len*8 && ones >= 96 && ip.To4() != nil {
+			ones -= 96
+		}
 		return ip.Mask(ipNet.Mask).String(), ones
 	}
 	if ip := net.ParseIP(cidr); ip != nil {
@@ -306,7 +291,7 @@ func cidrToPrefixRange(cidr string) (string, int) {
 }
 
 // renderDownstreamTLSContextYAML emits Envoy's listener-side TLS context
-// with file-backed leaf cert/key. Paths come from the translator input.
+// using a file-based dynamic TLS secret.
 func renderDownstreamTLSContextYAML(ctx *DownstreamTLSContext, indent int) string {
 	prefix := strings.Repeat(" ", indent)
 	var sb strings.Builder
@@ -321,11 +306,13 @@ func renderDownstreamTLSContextYAML(ctx *DownstreamTLSContext, indent int) strin
 	sb.WriteString(fmt.Sprintf("%s      alpn_protocols:\n", prefix))
 	sb.WriteString(fmt.Sprintf("%s      - h2\n", prefix))
 	sb.WriteString(fmt.Sprintf("%s      - http/1.1\n", prefix))
-	sb.WriteString(fmt.Sprintf("%s      tls_certificates:\n", prefix))
-	sb.WriteString(fmt.Sprintf("%s      - certificate_chain:\n", prefix))
-	sb.WriteString(fmt.Sprintf("%s          filename: \"%s\"\n", prefix, ctx.CertPath))
-	sb.WriteString(fmt.Sprintf("%s        private_key:\n", prefix))
-	sb.WriteString(fmt.Sprintf("%s          filename: \"%s\"\n", prefix, ctx.KeyPath))
+	sb.WriteString(fmt.Sprintf("%s      tls_certificate_sds_secret_configs:\n", prefix))
+	sb.WriteString(fmt.Sprintf("%s      - name: %s\n", prefix, MITMCertSecretName))
+	sb.WriteString(fmt.Sprintf("%s        sds_config:\n", prefix))
+	sb.WriteString(fmt.Sprintf("%s          path_config_source:\n", prefix))
+	sb.WriteString(fmt.Sprintf("%s            path: \"%s\"\n", prefix, yamlEscapeScalar(ctx.SecretPath)))
+	sb.WriteString(fmt.Sprintf("%s            watched_directory:\n", prefix))
+	sb.WriteString(fmt.Sprintf("%s              path: \"%s\"\n", prefix, yamlEscapeScalar(filepath.Dir(ctx.SecretPath))))
 	return sb.String()
 }
 
@@ -435,6 +422,11 @@ func renderHTTPConnManagerYAML(f *NetworkFilter, indent int) string {
 	sb.WriteString(fmt.Sprintf("%s    stat_prefix: %s\n", prefix, cfg.StatPrefix))
 	sb.WriteString(fmt.Sprintf("%s    internal_address_config: {}\n", prefix))
 
+	// The listener inspector recognizes custom methods. Accept them in every
+	// HTTP chain too, so HTTP RBAC and audit run instead of a codec rejection.
+	sb.WriteString(fmt.Sprintf("%s    http_protocol_options:\n", prefix))
+	sb.WriteString(fmt.Sprintf("%s      allow_custom_methods: true\n", prefix))
+
 	// [H3] Disable stream idle timeout. Envoy default is 5 minutes, which
 	// kills SSE, long-polling, streaming AI inference, and similar long-lived
 	// HTTP streams. Setting to 0s means "no timeout" — the upstream service
@@ -445,27 +437,31 @@ func renderHTTPConnManagerYAML(f *NetworkFilter, indent int) string {
 	// [M1] Enable path normalization to prevent RBAC path-based rule bypass.
 	// Without these, attackers can use "/api/../admin" or "//api//v1" to
 	// evade path-matching DENY rules. Envoy defaults both to false.
+	// Decode escaped separators before normalization and RBAC, and forward
+	// that same path upstream. normalize_path alone preserves %2F and %5C,
+	// which a backend may decode into a different, protected resource.
+	sb.WriteString(fmt.Sprintf("%s    path_with_escaped_slashes_action: UNESCAPE_AND_FORWARD\n", prefix))
 	sb.WriteString(fmt.Sprintf("%s    normalize_path: true\n", prefix))
 	sb.WriteString(fmt.Sprintf("%s    merge_slashes: true\n", prefix))
 
-	// HCM access_log: SEPARATE entries for deny and shadow CEL.
-	// Same rationale as listener-level: Envoy CEL || does not short-circuit
-	// properly when the left operand produces an evaluation error.
+	// One logger selects the union of deny and audit events, without duplicates.
 	if cfg.AccessLogEnabled && (cfg.AccessLogDenyCEL != "" || cfg.AccessLogShadowCEL != "") {
 		sb.WriteString(fmt.Sprintf("%s    access_log:\n", prefix))
 		listPrefix := prefix + "    "
-		if cfg.AccessLogDenyCEL != "" {
-			renderALSAccessLogEntry(&sb, listPrefix, cfg.AccessLogDenyCEL, cfg.AuditSink.denyLogName(), cfg.AuditSink.clusterName(), cfg.FilterChainName, true, cfg.AuditSink.ALSBufferFlushInterval, cfg.AuditSink.ALSBufferSizeBytes)
-		}
-		if cfg.AccessLogShadowCEL != "" {
-			renderALSAccessLogEntry(&sb, listPrefix, cfg.AccessLogShadowCEL, cfg.AuditSink.auditLogName(), cfg.AuditSink.clusterName(), cfg.FilterChainName, true, cfg.AuditSink.ALSBufferFlushInterval, cfg.AuditSink.ALSBufferSizeBytes)
-		}
+		renderALSAccessLogEntry(&sb, listPrefix, cfg.AccessLogDenyCEL, cfg.AccessLogShadowCEL, cfg.AuditSink.eventLogName(), cfg.AuditSink.clusterName(), cfg.FilterChainName, true, cfg.AuditSink.ALSBufferFlushInterval, cfg.AuditSink.ALSBufferSizeBytes)
 	}
 
 	// Route config
 	if cfg.RouteConfig != nil {
 		sb.WriteString(fmt.Sprintf("%s    route_config:\n", prefix))
 		sb.WriteString(fmt.Sprintf("%s      name: %s\n", prefix, cfg.RouteConfig.Name))
+		if cfg.RouteConfig.IgnorePortInHostMatching {
+			sb.WriteString(fmt.Sprintf("%s      ignore_port_in_host_matching: true\n", prefix))
+		}
+		// CDS and LDS file notifications are consumed asynchronously. Accept the
+		// route while its dynamic cluster is loading; a missing cluster produces
+		// a local error instead of rejecting the new listener and retaining old RBAC.
+		sb.WriteString(fmt.Sprintf("%s      validate_clusters: false\n", prefix))
 		sb.WriteString(fmt.Sprintf("%s      virtual_hosts:\n", prefix))
 		for _, vh := range cfg.RouteConfig.VirtualHosts {
 			sb.WriteString(fmt.Sprintf("%s      - name: %s\n", prefix, vh.Name))
@@ -483,7 +479,10 @@ func renderHTTPConnManagerYAML(f *NetworkFilter, indent int) string {
 				for _, h := range vh.RequestHeadersToAdd {
 					sb.WriteString(fmt.Sprintf("%s        - header:\n", prefix))
 					sb.WriteString(fmt.Sprintf("%s            key: \"%s\"\n", prefix, yamlEscapeScalar(h.Name)))
-					sb.WriteString(fmt.Sprintf("%s            value: \"%s\"\n", prefix, yamlEscapeScalar(h.Value)))
+					// Envoy expands %...% in header values. Policy values are literal,
+					// including resolved Secret data, so escape formatter syntax first.
+					value := strings.ReplaceAll(h.Value, "%", "%%")
+					sb.WriteString(fmt.Sprintf("%s            value: \"%s\"\n", prefix, yamlEscapeScalar(value)))
 					sb.WriteString(fmt.Sprintf("%s          append_action: OVERWRITE_IF_EXISTS_OR_ADD\n", prefix))
 				}
 			}
@@ -601,40 +600,37 @@ func renderPermissionRuleYAML(rule PermissionRule, indent int, rbacType string) 
 		sb.WriteString(fmt.Sprintf("%s- any: true\n", prefix))
 
 	case "destination_ip":
-		ipStr := rule.Value.(string)
-		ip, cidrNet, err := net.ParseCIDR(ipStr)
-		if err != nil {
-			sb.WriteString(fmt.Sprintf("%s- destination_ip:\n", prefix))
-			sb.WriteString(fmt.Sprintf("%s    address_prefix: \"%s\"\n", prefix, yamlEscapeScalar(ipStr)))
-			sb.WriteString(fmt.Sprintf("%s    prefix_len: 32\n", prefix))
-		} else {
-			ones, _ := cidrNet.Mask.Size()
-			sb.WriteString(fmt.Sprintf("%s- destination_ip:\n", prefix))
-			sb.WriteString(fmt.Sprintf("%s    address_prefix: \"%s\"\n", prefix, ip.Mask(cidrNet.Mask).String()))
-			sb.WriteString(fmt.Sprintf("%s    prefix_len: %d\n", prefix, ones))
-		}
+		address, bits := cidrToPrefixRange(rule.Value.(string))
+		sb.WriteString(fmt.Sprintf("%s- destination_ip:\n", prefix))
+		sb.WriteString(fmt.Sprintf("%s    address_prefix: \"%s\"\n", prefix, yamlEscapeScalar(address)))
+		sb.WriteString(fmt.Sprintf("%s    prefix_len: %d\n", prefix, bits))
 
 	case "destination_port":
 		port := rule.Value.(uint16)
 		sb.WriteString(fmt.Sprintf("%s- destination_port: %d\n", prefix, port))
 
 	case "destination_port_range":
-		rangeVal := rule.Value.(map[string]uint16)
+		rangeVal := rule.Value.(map[string]uint32)
 		sb.WriteString(fmt.Sprintf("%s- destination_port_range:\n", prefix))
 		sb.WriteString(fmt.Sprintf("%s    start: %d\n", prefix, rangeVal["start"]))
 		sb.WriteString(fmt.Sprintf("%s    end: %d\n", prefix, rangeVal["end"]))
 
 	case "requested_server_name":
+		// SNI carries a DNS name; fold case for both exact and wildcard hosts.
 		sniVal := rule.Value.(map[string]string)
 		if exact, ok := sniVal["exact"]; ok {
 			sb.WriteString(fmt.Sprintf("%s- requested_server_name:\n", prefix))
 			sb.WriteString(fmt.Sprintf("%s    exact: \"%s\"\n", prefix, yamlEscapeScalar(exact)))
+			sb.WriteString(fmt.Sprintf("%s    ignore_case: true\n", prefix))
 		} else if suffix, ok := sniVal["suffix"]; ok {
 			sb.WriteString(fmt.Sprintf("%s- requested_server_name:\n", prefix))
 			sb.WriteString(fmt.Sprintf("%s    suffix: \"%s\"\n", prefix, yamlEscapeScalar(suffix)))
+			sb.WriteString(fmt.Sprintf("%s    ignore_case: true\n", prefix))
 		}
 
 	case "header":
+		// Fold HTTP host values only; methods, paths and other headers retain
+		// their case-sensitive semantics. Do not rewrite the forwarded request.
 		headerVal := rule.Value.(map[string]string)
 		name := headerVal["name"]
 		sb.WriteString(fmt.Sprintf("%s- header:\n", prefix))
@@ -642,13 +638,26 @@ func renderPermissionRuleYAML(rule PermissionRule, indent int, rbacType string) 
 		if exact, ok := headerVal["exact_match"]; ok {
 			sb.WriteString(fmt.Sprintf("%s    string_match:\n", prefix))
 			sb.WriteString(fmt.Sprintf("%s      exact: \"%s\"\n", prefix, yamlEscapeScalar(exact)))
+			if name == ":authority" {
+				sb.WriteString(fmt.Sprintf("%s      ignore_case: true\n", prefix))
+			}
 		} else if prefix_, ok := headerVal["prefix_match"]; ok {
 			sb.WriteString(fmt.Sprintf("%s    string_match:\n", prefix))
 			sb.WriteString(fmt.Sprintf("%s      prefix: \"%s\"\n", prefix, yamlEscapeScalar(prefix_)))
+			if name == ":authority" {
+				sb.WriteString(fmt.Sprintf("%s      ignore_case: true\n", prefix))
+			}
 		} else if suffix, ok := headerVal["suffix_match"]; ok {
 			sb.WriteString(fmt.Sprintf("%s    string_match:\n", prefix))
 			sb.WriteString(fmt.Sprintf("%s      suffix: \"%s\"\n", prefix, yamlEscapeScalar(suffix)))
+			if name == ":authority" {
+				sb.WriteString(fmt.Sprintf("%s      ignore_case: true\n", prefix))
+			}
 		} else if safeRegex, ok := headerVal["safe_regex_match"]; ok {
+			// StringMatcher.ignore_case does not apply to regular expressions.
+			if name == ":authority" {
+				safeRegex = "(?i)" + safeRegex
+			}
 			sb.WriteString(fmt.Sprintf("%s    string_match:\n", prefix))
 			sb.WriteString(fmt.Sprintf("%s      safe_regex:\n", prefix))
 			sb.WriteString(fmt.Sprintf("%s        regex: \"%s\"\n", prefix, yamlEscapeScalar(safeRegex)))
@@ -743,8 +752,11 @@ func renderClustersYAML(version int64, mitmEnabled bool, audit AuditSinkConfig) 
 		sb.WriteString("    typed_config:\n")
 		sb.WriteString("      \"@type\": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext\n")
 		sb.WriteString("      common_tls_context:\n")
-		sb.WriteString("        validation_context:\n")
-		sb.WriteString(fmt.Sprintf("          trusted_ca:\n            filename: %s\n", varmorconfig.MITMUpstreamTrustedCAPath))
+		sb.WriteString("        validation_context_sds_secret_config:\n")
+		sb.WriteString(fmt.Sprintf("          name: %s\n", MITMValidationSecretName))
+		sb.WriteString("          sds_config:\n            path_config_source:\n")
+		sb.WriteString(fmt.Sprintf("              path: %s\n", MITMValidationSDSPath))
+		sb.WriteString("              watched_directory:\n                path: /etc/envoy/tls\n")
 	}
 	renderALSClusterYAML(&sb, audit)
 	return sb.String()
@@ -820,25 +832,48 @@ func alsGRPCConfigType(l7 bool) string {
 	return "type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.TcpGrpcAccessLogConfig"
 }
 
-// renderALSAccessLogEntry renders a single gRPC ALS access_log list item gated
-// by a CEL expression filter, routing records to the gRPC ALS cluster over UDS.
-//
-// itemPrefix is the indentation of the leading "- " list marker. For L7 entries
-// a custom_tags entry carrying the filter_chain name is emitted so the agent can
-// attribute records to a specific filter chain; L4 listener-level access_log is
-// shared across passthrough chains, so filterChain is passed empty and no tag is
-// emitted.
-func renderALSAccessLogEntry(sb *strings.Builder, itemPrefix, celExpr, logName, clusterName, filterChain string, l7 bool, bufferFlushInterval string, bufferSizeBytes uint32) {
+// renderAccessLogFilter combines independently evaluated CEL filters in one
+// logger. CEL evaluation errors become false within each child; OrFilter
+// selects the logger once even when both deny and shadow rules match.
+// Callers omit the logger entirely when neither condition is enabled.
+func renderAccessLogFilter(sb *strings.Builder, prefix, denyCEL, shadowCEL string) {
+	sb.WriteString(prefix + "filter:\n")
+	if denyCEL != "" && shadowCEL != "" {
+		sb.WriteString(prefix + "  or_filter:\n")
+		sb.WriteString(prefix + "    filters:\n")
+		for _, expr := range []string{denyCEL, shadowCEL} {
+			sb.WriteString(prefix + "    - extension_filter:\n")
+			renderCELFilterConfig(sb, prefix+"        ", expr)
+		}
+		return
+	}
+	expr := denyCEL
+	if expr == "" {
+		expr = shadowCEL
+	}
+	sb.WriteString(prefix + "  extension_filter:\n")
+	renderCELFilterConfig(sb, prefix+"    ", expr)
+}
+
+func renderCELFilterConfig(sb *strings.Builder, prefix, expr string) {
+	sb.WriteString(prefix + "name: envoy.access_loggers.extension_filters.cel\n")
+	sb.WriteString(prefix + "typed_config:\n")
+	sb.WriteString(prefix + "  \"@type\": type.googleapis.com/envoy.extensions.access_loggers.filters.cel.v3.ExpressionFilter\n")
+	sb.WriteString(prefix + "  expression: " + yamlCEL(expr) + "\n")
+}
+
+// renderALSAccessLogEntry renders one logger for all selected events. L7 uses
+// an HTTP ALS config with a filter-chain tag; L4 uses a TCP ALS config.
+func renderALSAccessLogEntry(sb *strings.Builder, itemPrefix, denyCEL, shadowCEL, logName, clusterName, filterChain string, l7 bool, bufferFlushInterval string, bufferSizeBytes uint32) {
 	b := itemPrefix + "  "
 	sb.WriteString(itemPrefix + "- name: envoy.access_loggers.grpc\n")
-	sb.WriteString(b + "filter:\n")
-	sb.WriteString(b + "  extension_filter:\n")
-	sb.WriteString(b + "    name: envoy.access_loggers.extension_filters.cel\n")
-	sb.WriteString(b + "    typed_config:\n")
-	sb.WriteString(b + "      \"@type\": type.googleapis.com/envoy.extensions.access_loggers.filters.cel.v3.ExpressionFilter\n")
-	sb.WriteString(b + "      expression: " + yamlCEL(celExpr) + "\n")
+	renderAccessLogFilter(sb, b, denyCEL, shadowCEL)
 	sb.WriteString(b + "typed_config:\n")
 	sb.WriteString(b + "  \"@type\": " + alsGRPCConfigType(l7) + "\n")
+	if l7 {
+		// The ALS method enum cannot represent extension methods or their case.
+		sb.WriteString(b + "  additional_request_headers_to_log: [\":method\"]\n")
+	}
 	sb.WriteString(b + "  common_config:\n")
 	sb.WriteString(b + "    log_name: \"" + yamlEscapeScalar(logName) + "\"\n")
 	sb.WriteString(b + "    transport_api_version: V3\n")

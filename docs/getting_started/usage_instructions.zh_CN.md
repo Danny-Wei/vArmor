@@ -40,6 +40,7 @@ vArmor 支持将策略对象配置为仅审计不拦截（观察模式）、拦�
 * 受限于 Seccomp 原理和性能影响，您需要组合使用 `auditViolations=true` 和 `allowViolations=true`，在没有策略处于 BehaviorModeling 模式时，实现仅审计不拦截的效果（观察模式）。
 * 受限于 AppArmor LSM 和 Seccomp 的原理，使用 AppArmor 或 Seccomp enforcer 时，可能无法关联短进程的所属容器和 Pod 信息。
 * NetworkProxy enforcer 通过其 Envoy sidecar 上报出口流量的审计事件。由于这些事件由代理在 Pod 粒度上产生，因此仅携带 Pod 级别的身份信息（`nodeName`、`podName`、`podNamespace`、`podUID`）。
+* 对于 NetworkProxy enforcer，违规记录写入 `/var/log/varmor/violations.log` 的方式取决于运行时。在 runc 下，Envoy sidecar 将记录流式发送到节点级的 `varmor-agent`，由其写入宿主机上的日志文件；在微虚机运行时(kata / Serverless 沙箱)下，则改由 sidecar 内置的审计 sink 写入容器自身文件系统中的日志文件(记录内容逐字节一致)。工作负载是否被视为微虚机，由 `varmor-config` ConfigMap 中的 `microVMDetection` 规则决定，详见[NetworkProxy 审计的微虚机(Kata)识别](../getting_started/installation.zh_CN.md#networkproxy-审计的微虚机kata识别)。
 
 ```json
 {
@@ -59,6 +60,9 @@ vArmor 支持将策略对象配置为仅审计不拦截（观察模式）、拦�
   "enforcer": "BPF",
   "action": "DENIED",
   "profileName": "varmor-demo-demo-2",
+  "policyKind": "VarmorPolicy",
+  "policyName": "demo-2",
+  "policyNamespace": "demo",
   "event": {
     "operation": "File",
     "permissions": [
@@ -244,8 +248,10 @@ vArmor 支持将策略对象配置为仅审计不拦截（观察模式）、拦�
   |          |Type=Created<br />Status=False<br />Reason=XXX<br />Message=YYY|VarmorPolicy 的创建事件已经被 controller 响应，但处理失败。包含失败的原因及错误信息
   |          |Type=Updated<br />Status=True|VarmorPolicy 的更新事件已经被 controller 响应，且处理成功
   |          |Type=Updated<br />Status=False<br />Reason=XXX<br />Message=YYY|VarmorPolicy 的更新事件已经被 controller 响应，但处理失败。包含失败的原因及错误信息
-  |Ready|True|Profile 已经被所有的 Agents 处理和加载
-  |     |False|Profile 还未被所有的 Agents 处理和加载
+  |Ready|True|汇总状态表示期望的 Agent 已报告处理成功
+  |     |False|汇总状态尚未满足期望的 Agent 成功数量
+
+状态异步更新，可能缺失或过时；Ready 不等于当前工作负载已验证防护生效。节点错误应结合 ArmorProfile Conditions 和 Agent/Manager 日志排查。恢复步骤与限制见[故障排查](../../website/i18n/zh-cn/docusaurus-plugin-content-docs/current/guides/troubleshooting.md#status-limits)。
 
 ### VarmorClusterPolicy
 * 集群范围资源
@@ -262,8 +268,8 @@ vArmor 支持将策略对象配置为仅审计不拦截（观察模式）、拦�
     |字段|值|含义|
     |---|--|---|
     |DesiredNumberLoaded|int|期望处理并响应的 Agent 数量
-    |CurrentNumberLoaded|int|已经处理并响应的 Agent 数量
-    |Conditions|type=Read<br />Status=False<br />NodeName=XXX<br />Message=YYY|处理失败的节点，以及错误信息
+    |CurrentNumberLoaded|int|报告处理成功的 Agent 数量
+    |Conditions|type=Ready<br />Status=False<br />NodeName=XXX<br />Message=YYY|处理失败的节点，以及错误信息
 
 ## 示例
 

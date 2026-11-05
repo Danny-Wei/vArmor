@@ -206,6 +206,9 @@ description: The interface specification of vArmor.
 
 ## NetworkProxyConfig
 
+For behavior, examples and operational boundaries, read the [NetworkProxy guide](../guides/enforcers/networkproxy/index.md). This reference defines the fields; it does not imply all changes apply to existing Pods automatically.
+
+
 | Field | Description |
 |-------|-------------|
 |mitm<br />*[MITMConfig](#mitmconfig)*|Optional. Configures TLS Man-in-the-Middle for inspecting encrypted HTTPS traffic at the HTTP level. vArmor automatically generates a self-signed CA per policy and injects the CA bundle into application containers. |
@@ -218,14 +221,14 @@ description: The interface specification of vArmor.
 
 | Field | Description |
 |-------|-------------|
-|domains<br />*string array*|Specifies which TLS connections should be terminated for L7 inspection. Only connections to these domains will be decrypted; all other TLS traffic passes through unmodified. Supports exact match ("api.openai.com") and wildcard ("*.openai.com"). Wildcard matching follows RFC 6125. |
-|headerMutations<br />*[HeaderMutation](#headermutation) array*|Optional. Per-domain HTTP header injection rules. Each entry's domain must literally equal one of the entries in `domains` (no wildcard expansion is performed). Typically used for injecting API keys or authentication tokens into requests destined for specific upstream services, enabling centralized credential management at the proxy layer. |
+|domains<br />*string array*|Specifies which TLS connections should be terminated for L7 inspection. Only connections to these domains will be decrypted; all other TLS traffic passes through unmodified. Supports exact match (`"api.openai.com"`) and wildcard (`"*.openai.com"`). Wildcard matching follows RFC 6125. Leading and trailing whitespace is rejected. Equivalent duplicate MITM identities are rejected. |
+|headerMutations<br />*[HeaderMutation](#headermutation) array*|Optional. Per-domain HTTP header injection rules. Each entry's domain must literally equal one of the entries in `domains`, including case (no wildcard or IP/CIDR alias expansion is performed). Leading and trailing whitespace is rejected. Typically used for injecting API keys or authentication tokens into requests destined for specific upstream services, enabling centralized credential management at the proxy layer. |
 
 ### HeaderMutation
 
 | Field | Description |
 |-------|-------------|
-|domain<br />*string*|Specifies which MITM domain this mutation applies to. Must literally equal one of the entries in `MITMConfig.Domains`. |
+|domain<br />*string*|Specifies which MITM domain this mutation applies to. Must literally equal one of the entries in `MITMConfig.Domains`, including case. Leading and trailing whitespace is rejected. |
 |headers<br />*[HeaderAction](#headeraction) array*|The list of headers to inject for this domain. |
 
 ### HeaderAction
@@ -234,7 +237,9 @@ description: The interface specification of vArmor.
 |-------|-------------|
 |name<br />*string*|The HTTP header name (e.g., "Authorization", "x-api-key"). |
 |value<br />*string*|Optional. A literal header value. Use this for non-sensitive values. Mutually exclusive with `secretRef`. |
-|secretRef<br />*[SecretKeyRef](#secretkeyref)*|Optional. References a Kubernetes Secret key containing the header value. Use this for sensitive values such as API keys or tokens. The referenced Secret must be pre-created by the user in the same namespace as the target workload. The controller reads the Secret value at reconcile time and inlines it into the Envoy xDS configuration. Mutually exclusive with `value`. |
+|secretRef<br />*[SecretKeyRef](#secretkeyref)*|Optional. References a Kubernetes Secret key containing the header value. Use this for sensitive values such as API keys or tokens. The referenced Secret must be pre-created by the user in the same namespace as the target workload. vArmor reads the Secret when processing the policy and stores the resolved value in the generated proxy configuration Secret, which is mounted in the sidecar. Mutually exclusive with `value`. |
+
+SecretRef values must be nonempty; nonempty values are preserved verbatim. The value is checked when vArmor processes the policy, so a successful API submission alone does not mean the configuration is valid. An empty value sets the policy status to Error with Ready=false. An invalid create publishes no configuration Secret in that namespace; an invalid update retains its previous complete configuration. Cluster policies do not provide atomic updates across namespaces. After correcting the referenced Secret, update the policy spec as described in [credential rotation](../guides/enforcers/networkproxy/tls-and-credentials.md#rotate-and-verify). Changing the Secret alone does not apply the new value.
 
 ### SecretKeyRef
 
@@ -256,6 +261,8 @@ Built-in defaults:
 |------|-------------|----------------|-----------|--------------|
 | Non-MITM | 50m | 64Mi | 500m | 256Mi |
 | MITM | 100m | 128Mi | 1000m | 512Mi |
+
+> The resolved resources follow a three-layer, field-level merge chain: this per-policy override > the cluster-global default set in the `varmor-config` ConfigMap > the built-in defaults above. See [Default Resources of the NetworkProxy Sidecar](./installation.md#default-resources-of-the-networkproxy-sidecar) for the cluster-global configuration.
 
 ## NetworkProxyRules
 
@@ -296,7 +303,7 @@ Built-in defaults:
 |hosts<br />*string array*|Optional. Hosts specifies the target service domains to match. Supports exact match ("api.openai.com") and wildcard ("*.openai.com"). Multiple values are OR'd.|
 |ports<br />*[Port](#port) array*|Optional. Ports restricts the rule to specific destination ports.|
 |paths<br />*[HTTPPathMatch](#httppathmatch) array*|Optional. Paths specifies HTTP request path matching. For HTTPS traffic, path matching requires MITM to be configured.|
-|methods<br />*string array*|Optional. Methods specifies HTTP methods to match (e.g., GET, POST). For HTTPS traffic, method matching requires MITM to be configured.|
+|methods<br />*string array*|Optional. Methods specifies HTTP methods to match (e.g., GET, POST). For HTTPS traffic, method matching requires MITM to be configured. Values are matched exactly and case-sensitively without uppercasing; `GET`, `get`, and `Get` are distinct methods. Existing policies that used `get` to mean standard `GET` must explicitly use `GET` when upgrading.|
 
 ### HTTPPathMatch
 

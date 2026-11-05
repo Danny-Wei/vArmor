@@ -21,6 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	varmor "github.com/bytedance/vArmor/apis/varmor/v1beta1"
+	varmorconfig "github.com/bytedance/vArmor/internal/config"
 )
 
 // TestValidateAddPolicy_ValidVarmorPolicy tests valid VarmorPolicy validation
@@ -450,6 +451,87 @@ func TestValidateUpdatePolicy_ValidUpdate(t *testing.T) {
 	assert.Equal(t, "", message, "Validation passes when validation passes")
 }
 
+func TestValidateUpdatePolicy_RemoveNetworkProxyConfig(t *testing.T) {
+	defaultProxyUID := varmorconfig.DefaultProxyUID
+	defaultProxyPort := varmorconfig.DefaultProxyPort
+	defaultProxyAdminPort := varmorconfig.DefaultProxyAdminPort
+	customProxyUID := int64(2000)
+	customProxyPort := uint16(16001)
+	customProxyAdminPort := uint16(16000)
+	tests := []struct {
+		name           string
+		oldProxyConfig *varmor.NetworkProxyConfig
+		valid          bool
+	}{
+		{
+			name:           "implicit defaults",
+			oldProxyConfig: &varmor.NetworkProxyConfig{},
+			valid:          true,
+		},
+		{
+			name: "explicit defaults",
+			oldProxyConfig: &varmor.NetworkProxyConfig{
+				ProxyUID:       &defaultProxyUID,
+				ProxyPort:      &defaultProxyPort,
+				ProxyAdminPort: &defaultProxyAdminPort,
+			},
+			valid: true,
+		},
+		{
+			name: "custom proxy UID",
+			oldProxyConfig: &varmor.NetworkProxyConfig{
+				ProxyUID: &customProxyUID,
+			},
+			valid: false,
+		},
+		{
+			name: "custom proxy port",
+			oldProxyConfig: &varmor.NetworkProxyConfig{
+				ProxyPort: &customProxyPort,
+			},
+			valid: false,
+		},
+		{
+			name: "custom proxy admin port",
+			oldProxyConfig: &varmor.NetworkProxyConfig{
+				ProxyAdminPort: &customProxyAdminPort,
+			},
+			valid: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := &varmor.VarmorPolicy{
+				Spec: varmor.VarmorPolicySpec{
+					Target: varmor.Target{
+						Kind: "Deployment",
+						Name: "test-deployment",
+					},
+					Policy: varmor.Policy{
+						Enforcer: "AppArmor",
+						Mode:     varmor.RuntimeDefaultMode,
+					},
+				},
+				Status: varmor.VarmorPolicyStatus{Phase: varmor.VarmorPolicyProtecting},
+			}
+
+			valid, message := ValidateUpdatePolicy(
+				policy,
+				"AppArmor",
+				policy.Spec.Target,
+				tt.oldProxyConfig,
+			)
+			assert.Equal(t, tt.valid, valid)
+			if tt.valid {
+				assert.Empty(t, message)
+			} else {
+				assert.Contains(t, message, "Modifying proxyUID, proxyPort, or proxyAdminPort")
+			}
+		})
+	}
+}
+
 // TestValidateUpdatePolicy_UnsupportedPolicyType tests unsupported policy type
 func TestValidateUpdatePolicy_UnsupportedPolicyType(t *testing.T) {
 	invalidPolicy := "invalid policy type"
@@ -662,7 +744,44 @@ func TestValidateUpdatePolicy_RemoveAppArmorEnforcer(t *testing.T) {
 
 	valid, message := ValidateUpdatePolicy(policy, oldEnforcer, oldTarget, nil)
 	assert.False(t, valid, "Removal of AppArmor enforcer should fail validation")
-	assert.Contains(t, message, "Modifying a policy to remove the AppArmor or Seccomp enforcer is not allowed")
+	assert.Contains(t, message, "Modifying a policy to remove the AppArmor, Seccomp, or NetworkProxy enforcer is not allowed")
+}
+
+func TestValidateUpdatePolicy_RemoveNetworkProxyEnforcer(t *testing.T) {
+	target := varmor.Target{Kind: "Deployment", Name: "test-deployment"}
+	policies := []struct {
+		name   string
+		policy interface{}
+	}{
+		{
+			name: "VarmorPolicy",
+			policy: &varmor.VarmorPolicy{
+				Spec: varmor.VarmorPolicySpec{
+					Target: target,
+					Policy: varmor.Policy{Enforcer: "BPF", Mode: varmor.RuntimeDefaultMode},
+				},
+				Status: varmor.VarmorPolicyStatus{Phase: varmor.VarmorPolicyProtecting},
+			},
+		},
+		{
+			name: "VarmorClusterPolicy",
+			policy: &varmor.VarmorClusterPolicy{
+				Spec: varmor.VarmorPolicySpec{
+					Target: target,
+					Policy: varmor.Policy{Enforcer: "BPF", Mode: varmor.RuntimeDefaultMode},
+				},
+				Status: varmor.VarmorPolicyStatus{Phase: varmor.VarmorPolicyProtecting},
+			},
+		},
+	}
+
+	for _, tt := range policies {
+		t.Run(tt.name, func(t *testing.T) {
+			valid, message := ValidateUpdatePolicy(tt.policy, "NetworkProxyBPF", target, nil)
+			assert.False(t, valid, "Removing NetworkProxy while retaining BPF should fail validation")
+			assert.Contains(t, message, "remove the AppArmor, Seccomp, or NetworkProxy enforcer is not allowed")
+		})
+	}
 }
 
 // TestValidateUpdatePolicy_EnhanceProtectModeWithoutConfig tests EnhanceProtect mode without configuration
@@ -1192,4 +1311,81 @@ func TestValidateNetworkProxyEgress_DefaultActionEmpty(t *testing.T) {
 	valid, msg := ValidateNetworkProxyEgress(egress)
 	assert.False(t, valid, "empty defaultAction should be rejected")
 	assert.Contains(t, msg, "defaultAction")
+}
+
+func policyForEnforcerValidation(enforcer string, clusterScope bool) interface{} {
+	spec := varmor.VarmorPolicySpec{
+		Target: varmor.Target{Kind: "Deployment", Name: "test-deployment"},
+		Policy: varmor.Policy{Enforcer: enforcer, Mode: varmor.RuntimeDefaultMode},
+	}
+	if clusterScope {
+		return &varmor.VarmorClusterPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-policy"},
+			Spec:       spec,
+		}
+	}
+	return &varmor.VarmorPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-policy", Namespace: "default"},
+		Spec:       spec,
+	}
+}
+
+func TestValidatePolicy_RejectsMalformedEnforcer(t *testing.T) {
+	resources := []struct {
+		name         string
+		clusterScope bool
+	}{
+		{name: "VarmorPolicy"},
+		{name: "VarmorClusterPolicy", clusterScope: true},
+	}
+	invalidEnforcers := []string{"", "unsupported", "BPFunsupported", "BPFBPF"}
+	target := varmor.Target{Kind: "Deployment", Name: "test-deployment"}
+
+	for _, resource := range resources {
+		for _, enforcer := range invalidEnforcers {
+			t.Run(resource.name+"/create/"+enforcer, func(t *testing.T) {
+				policy := policyForEnforcerValidation(enforcer, resource.clusterScope)
+				valid, message := ValidateAddPolicy(policy, true)
+				assert.False(t, valid, "malformed enforcer %q should be rejected", enforcer)
+				assert.Contains(t, message, "enforcer")
+			})
+
+			t.Run(resource.name+"/update/"+enforcer, func(t *testing.T) {
+				policy := policyForEnforcerValidation(enforcer, resource.clusterScope)
+				valid, message := ValidateUpdatePolicy(policy, "BPF", target, nil)
+				assert.False(t, valid, "malformed enforcer %q should be rejected", enforcer)
+				assert.Contains(t, message, "enforcer")
+			})
+		}
+	}
+}
+
+func TestValidatePolicy_AcceptsSupportedEnforcerCombinations(t *testing.T) {
+	resources := []struct {
+		name         string
+		clusterScope bool
+	}{
+		{name: "VarmorPolicy"},
+		{name: "VarmorClusterPolicy", clusterScope: true},
+	}
+	validEnforcers := []string{
+		"AppArmor", "BPF", "Seccomp", "NetworkProxy",
+		"AppArmorBPF", "AppArmorSeccomp", "AppArmorNetworkProxy", "BPFSeccomp", "BPFNetworkProxy", "SeccompNetworkProxy",
+		"AppArmorBPFSeccomp", "AppArmorBPFNetworkProxy", "AppArmorSeccompNetworkProxy", "BPFSeccompNetworkProxy",
+		"AppArmorBPFSeccompNetworkProxy", "NetworkProxyBPFSeccomp", "SeccompAppArmorBPF", "bpfNetworkProxy",
+	}
+	target := varmor.Target{Kind: "Deployment", Name: "test-deployment"}
+
+	for _, resource := range resources {
+		for _, enforcer := range validEnforcers {
+			t.Run(resource.name+"/"+enforcer, func(t *testing.T) {
+				policy := policyForEnforcerValidation(enforcer, resource.clusterScope)
+				valid, message := ValidateAddPolicy(policy, true)
+				assert.True(t, valid, "supported enforcer %q should be accepted on create: %s", enforcer, message)
+
+				valid, message = ValidateUpdatePolicy(policy, enforcer, target, nil)
+				assert.True(t, valid, "supported enforcer %q should be accepted on update: %s", enforcer, message)
+			})
+		}
+	}
 }

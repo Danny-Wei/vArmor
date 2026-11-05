@@ -1,0 +1,55 @@
+# Observation policy assembly skeleton (for the phase-one assembly step)
+#
+# This is not a policy ready for submission. The model uses it as a skeleton to assemble
+# a complete VarmorPolicy / VarmorClusterPolicy after collecting user-confirmed information.
+# Fill only confirmed information; rule selection must follow user intent. Once assembled, pass it to validate_policy.py
+# for deterministic validation + server dry-run + final user confirmation; never submit directly without validation.
+#
+# Required information (confirm every item with the user first):
+#   1) Policy type: VarmorPolicy or VarmorClusterPolicy
+#   2) metadata.name; namespace is also required for VP
+#   3) target.kind (Deployment/StatefulSet/DaemonSet/Pod)
+#   4) Target selection: target.name or target.selector (exactly one)
+#   5) target.containers (may be empty; empty means all application containers)
+#   6) policy.enforcer (must match actual node support; confirm through preflight)
+#   7) User-selected built-in / custom rules; consult builtin-rules-semantics.md
+#      for semantics, enforcer compatibility, and disruption risks; do not add rules on the user's behalf
+#   8) updateExistingWorkloads (must be confirmed; true immediately rolls out existing workloads)
+#   9) privileged (must be confirmed; defaults to false; true changes the AppArmor/BPF baseline; verify Seccomp separately)
+#
+# Assembly: populate/generate the CRD using the confirmed information above.
+# Validation: the model must not independently fix validation errors; only fixed script normalization is allowed, or return to the user
+# for renewed confirmation.
+
+apiVersion: crd.varmor.org/v1beta1
+kind: <VarmorPolicy|VarmorClusterPolicy>
+metadata:
+  name: <name>
+  namespace: <namespace>   # VarmorPolicy only
+spec:
+  updateExistingWorkloads: <true|false>   # User confirmation required; do not default to true
+  target:
+    kind: <Deployment|StatefulSet|DaemonSet|Pod>
+    # Choose exactly one of name or selector:
+    name: <workload-name>
+    # selector:
+    #   matchLabels: {app: <label>}
+    # containers: [<container-name>]   # May be empty
+  policy:
+    enforcer: <AppArmor|BPF|Seccomp|combination>
+    mode: EnhanceProtect
+    enhanceProtect:
+      privileged: <true|false>   # Confirmation required; defaults to false
+      # Observation switches (validate_policy.py fills these automatically; no manual entry required)
+      auditViolations: true
+      allowViolations: true
+      hardeningRules:
+      - <user-confirmed-hardening-rule>
+      attackProtectionRules:
+      - rules:
+        - <user-confirmed-attack-protection-rule>
+        # targets: [<executable-path>]   # AppArmor only
+      vulMitigationRules:
+      - <user-confirmed-vulnerability-mitigation-rule>
+      # Optional RawRules: appArmorRawRules / bpfRawRules /
+      # syscallRawRules (prefer SCMP_ACT_LOG during observation) / networkProxyRawRules

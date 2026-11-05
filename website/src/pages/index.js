@@ -5,12 +5,14 @@ import clsx from 'clsx';
 import Layout from '@theme/Layout';
 import styles from './index.module.css';
 import Link from '@docusaurus/Link';
+import {useLatestVersion} from '@docusaurus/plugin-content-docs/client';
 import Translate, {translate} from '@docusaurus/Translate';
 import { Analytics } from "@vercel/analytics/react";
 import ThemeImage from '@site/src/components/ThemeImage';
 import CodeBlock from '@theme/CodeBlock';
 
 function HomepageHeader() {
+  const docsVersion = useLatestVersion();
   return (
     <header className={clsx('hero', styles.heroBanner)}>
       <div className={styles.heroBgImage}></div>
@@ -32,7 +34,7 @@ function HomepageHeader() {
             <div className={styles.buttons}>
               <Link
                 className={clsx("button button--lg", styles.primaryButton)}
-                to="/docs/main/introduction">
+                to={`${docsVersion.path}/introduction`}>
                 <Translate id="homepage.hero.getStarted">Get Started</Translate>
               </Link>
               <Link
@@ -159,6 +161,7 @@ function Architecture() {
 }
 
 function QuickStart() {
+  const docsVersion = useLatestVersion();
   return (
     <section className={styles.quickStart}>
       <div className="container">
@@ -170,13 +173,13 @@ function QuickStart() {
           <div className={styles.quickStartStep}>
             <h3><Translate id="homepage.quickStart.step1.title">1. Fetch chart</Translate></h3>
             <CodeBlock language="bash">
-              helm pull oci://elkeid-ap-southeast-1.cr.volces.com/varmor/varmor --version 0.10.3
+              helm pull oci://elkeid-ap-southeast-1.cr.volces.com/varmor/varmor --version 0.10.6
             </CodeBlock>
           </div>
           <div className={styles.quickStartStep}>
             <h3><Translate id="homepage.quickStart.step2.title">2. Install</Translate></h3>
             <CodeBlock language="bash">
-              helm install varmor varmor-0.10.3.tgz --namespace varmor --create-namespace --set image.registry="elkeid-ap-southeast-1.cr.volces.com"
+              helm install varmor varmor-0.10.6.tgz --namespace varmor --create-namespace --set image.registry="elkeid-ap-southeast-1.cr.volces.com"
             </CodeBlock>
           </div>
           <div className={styles.quickStartStep}>
@@ -188,7 +191,7 @@ function QuickStart() {
             </p>
             <Link
               className="button button--primary"
-              to="/docs/main/introduction#quick-start">
+              to={`${docsVersion.path}/introduction#quick-start`}>
               <Translate id="homepage.quickStart.viewGuide">View Full Guide</Translate>
             </Link>
           </div>

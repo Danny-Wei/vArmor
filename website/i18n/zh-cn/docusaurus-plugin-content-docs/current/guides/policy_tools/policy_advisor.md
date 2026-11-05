@@ -12,7 +12,7 @@ description: 使用策略顾问生成策略模版。
 
 此功能可协助您使用内置策略生成以一个策略模版，您可以基于此模版来构造最终的策略。建议您尽可能多地提供目标工作负载的上下文信息、行为数据，从而使生成的模版更加精准。
 
-请使用 `-f FEATURES` 和 `-c CAPABILITIES` 参数来指定上下文信息。其中，`-f FEATURES` 参数用于显式地描述应用的特性，`-c CAPABILITIES` 参数用于显式地描述应用所需的能力。行为数据则通过 `-m BEHAVIOR_DATA` 参数传递，您可以使用 **[BehaviorModeling 模式](policies_and_rules/policy_modes/behavior_modeling.md)** 为目标应用生成 ArmorProfileModel 然后将其导出。
+请使用 `-f FEATURES` 和 `-c CAPABILITIES` 参数来指定上下文信息。其中，`-f FEATURES` 参数用于显式地描述应用的特性，`-c CAPABILITIES` 参数用于显式地描述应用所需的能力。行为数据则通过 `-m BEHAVIOR_DATA` 参数传递，您可以使用 **[BehaviorModeling 模式](../policies_and_rules/policy_modes/behavior_modeling.md)** 为目标应用生成 ArmorProfileModel 然后将其导出。
 
 
 ## 示例
@@ -24,6 +24,8 @@ description: 使用策略顾问生成策略模版。
 使用行为数据过滤掉与之冲突的内置规则，从而使策略模版更加精准。
 
 `policy-advisor.py AppArmor,BPF -f share-containers-pid-ns -c sys_admin,net_admin,kill -m data.json`
+
+> 在将行为数据与 `disable-shell` 等规则进行匹配时，advisor 会同时依据可执行文件的 basename 及其文件扩展名进行判断。因此，即使某个 shell 仅以脚本路径的形式被记录(例如 `/var/lib/cilium/bpf/init.sh`，且没有 `sh`/`bash`/`dash` 二进制),也能通过其 `.sh` 扩展名被识别为冲突，从而过滤掉相应的冲突规则。
 
 
 ## 用法

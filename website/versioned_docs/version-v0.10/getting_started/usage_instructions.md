@@ -5,7 +5,7 @@ description: Understand how to use vArmor.
 # Usage Instructions
 
 ## Interface Operations
-vArmor provides API interfaces through [VarmorPolicy](interface_specification.md#varmorpolicy) and [VarmorClusterPolicy](interface_specification.md#varmorclusterpolicy) CR. The VarmorClusterPolicy CR have higher priority than VarmorPolicy CR. It means prioritizing the use of VarmorClusterPolicy objects to protect matched workloads. You can create, modify, and delete VarmorPolicy or VarmorClusterPolicy objects in the cluster to protect specified workloads.
+vArmor provides API interfaces through [VarmorPolicy](interface_specification.md#varmorpolicy--varmorclusterpolicy) and [VarmorClusterPolicy](interface_specification.md#varmorpolicy--varmorclusterpolicy) CR. The VarmorClusterPolicy CR have higher priority than VarmorPolicy CR. It means prioritizing the use of VarmorClusterPolicy objects to protect matched workloads. You can create, modify, and delete VarmorPolicy or VarmorClusterPolicy objects in the cluster to protect specified workloads.
 
 vArmor supports performing a rolling restart of existing workloads that meet the matching conditions when a VarmorPolicy or VarmorClusterPolicy object is created or deleted. This rolling restart enables or disables protection for those workloads.
 
@@ -41,6 +41,7 @@ Notes:
 * Limited by the principle and performance impact of Seccomp, you can only use `auditViolations=true` and `allowViolations=true` in combination to implement the audit-only mode (observation mode) for the Seccomp enforcer when there is no policy in the BehaviorModeling mode.
 * Limited by the principle of the AppArmor LSM and Seccomp, when using the AppArmor or Seccomp enforcer, it may not be possible to associate container and Pod information for the short-lived processes.
 * The NetworkProxy enforcer reports egress traffic audit events through its Envoy sidecar. Because these events are produced by the proxy at the Pod granularity, they only carry Pod-level identity (`nodeName`, `podName`, `podNamespace`, `podUID`).
+* For the NetworkProxy enforcer, the way violation records reach `/var/log/varmor/violations.log` depends on the runtime. Under runc, the Envoy sidecar streams them to the node-level `varmor-agent`, which writes the log on the host. Under a micro-VM runtime (kata / serverless sandbox), an in-sidecar audit sink writes the log inside the container's own filesystem instead (the records are byte-identical). Whether a workload is treated as micro-VM is decided by the `microVMDetection` rules in the `varmor-config` ConfigMap; see [Micro-VM (Kata) Detection for NetworkProxy Auditing](../getting_started/installation.md#micro-vm-kata-detection-for-networkproxy-auditing).
 
 ```json
 {
@@ -60,6 +61,9 @@ Notes:
   "enforcer": "BPF",
   "action": "DENIED",
   "profileName": "varmor-demo-demo-2",
+  "policyKind": "VarmorPolicy",
+  "policyName": "demo-2",
+  "policyNamespace": "demo",
   "event": {
     "operation": "File",
     "permissions": [
@@ -230,7 +234,7 @@ Notes:
 ### VarmorPolicy
 * Namespace-scoped resource, consistent with the namespace of the protected object.
 * The VarmorPolicy interface details can be found in [Interface Specification](interface_specification.md).
-* The definition of VarmorPolicy can be found in [VarmorPolicy CRD](https://github.com/bytedance/vArmor/tree/main/config/crds/crd.varmor.org_varmorpolicies.yaml).
+* The definition of VarmorPolicy can be found in [VarmorPolicy CRD](https://github.com/bytedance/vArmor/tree/v0.10.6/config/crds/crd.varmor.org_varmorpolicies.yaml).
 * Explanation of `VarmorPolicy/Status`:
 
   | Fields | Value | Interpretation |
@@ -244,26 +248,28 @@ Notes:
   |          |Type=Created<br />Status=False<br />Reason=XXX<br />Message=YYY|The creation event of VarmorPolicy has been responded to by the controller, but processing has failed. This includes the reason for the failure and error information.
   |          |Type=Updated<br />Status=True|The update event of VarmorPolicy has been responded to by the controller and processed successfully.
   |          |Type=Updated<br />Status=False<br />Reason=XXX<br />Message=YYY|The update event of VarmorPolicy has been responded to by the controller, but processing has failed. This includes the reason for the failure and error information.
-  |Ready|True|The profile has been processed and loaded by all agents.
-  |     |False|The profile has not yet been processed and loaded by all agents.
+  |Ready|True|The aggregate status records success for the expected agents.
+  |     |False|The aggregate status has not reached the expected agent success count.
+
+Status updates are asynchronous and can be missing or stale; Ready is not proof of verified enforcement for the current workload. Correlate ArmorProfile conditions with Agent/Manager logs for node errors. See [Troubleshooting](../guides/troubleshooting.md#status-limits) for recovery steps and limits.
 
 ### VarmorClusterPolicy
 * Cluster-scoped resource.
 * The VarmorClusterPolicy interface details can be found in [Interface Specification](interface_specification.md)
-* The definition of VarmorClusterPolicy can be found in [VarmorClusterPolicy CRD](https://github.com/bytedance/vArmor/tree/main/config/crds/crd.varmor.org_varmorclusterpolicies.yaml)
+* The definition of VarmorClusterPolicy can be found in [VarmorClusterPolicy CRD](https://github.com/bytedance/vArmor/tree/v0.10.6/config/crds/crd.varmor.org_varmorclusterpolicies.yaml)
 * `VarmorClusterPolicy/Status` same as `VarmorPolicy/Status`
 
 ### ArmorProfile
 * Namespace-scoped resource, consistent with the namespace of the protected object or the namespace of the vArmor components.
 * **As an internal interface, used by vArmor only.**
-* The definition of ArmorProfile can be found in [ArmorProfile CRD](https://github.com/bytedance/vArmor/tree/main/config/crds/crd.varmor.org_armorprofiles.yaml).
+* The definition of ArmorProfile can be found in [ArmorProfile CRD](https://github.com/bytedance/vArmor/tree/v0.10.6/config/crds/crd.varmor.org_armorprofiles.yaml).
 * Explanation of `ArmorProfile/Status`:
 
   | Fields | Value | Interpretation |
   |--------|-------|----------------|
   |DesiredNumberLoaded|int|The desired number of agents for processing and responding
-  |CurrentNumberLoaded|int|The number of agents that have already been processed and responded.
-  |Conditions|type=Read<br />Status=False<br />NodeName=XXX<br />Message=YYY|The failed node and error information
+  |CurrentNumberLoaded|int|The number of agents reported as successfully processed.
+  |Conditions|type=Ready<br />Status=False<br />NodeName=XXX<br />Message=YYY|The failed node and error information
 
 ## Example
 The following example is for demonstration of functionality only, and should not be considered as recommended policy.
@@ -289,8 +295,8 @@ spec:
     mode: EnhanceProtect
     enhanceProtect:
       hardeningRules:
-      - disable_cap_privileged
-      - disable_cap_net_raw
+      - disable-cap-privileged
+      - disable-cap-net-raw
       attackProtectionRules:
       - rules: 
         - disable-write-etc
@@ -316,4 +322,4 @@ The built-in rules used are as follows:
 - Prohibit shell and its subprocesses from accessing the container's ServiceAccount information
 
 ## Demos
-Here are some [demos](https://github.com/bytedance/vArmor/tree/main/test/demos) on how to use vArmor to mitigate vulnerabilities or harden containers with privileged capabilities.
+Here are some [demos](https://github.com/bytedance/vArmor/tree/v0.10.6/test/demos) on how to use vArmor to mitigate vulnerabilities or harden containers with privileged capabilities.

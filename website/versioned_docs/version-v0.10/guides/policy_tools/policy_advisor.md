@@ -5,9 +5,9 @@ description: Generate a policy template with policy advisor.
 ---
 
 # Policy Advisor
-This program can help you generate a [`policy`](../getting_started/interface_specification.md#varmorpolicyspec--varmorclusterpolicyspec) template in the **EnhanceProtect** mode with built-in rules. The template can be a good start to craft the final policy. You can provide the context information and the behavior data of the target application to make the template more precise. 
+This program can help you generate a [`policy`](../../getting_started/interface_specification.md#varmorpolicyspec) template in the **EnhanceProtect** mode with built-in rules. The template can be a good start to craft the final policy. You can provide the context information and the behavior data of the target application to make the template more precise.
 
-Please use the `-f FEATURES` and `-c CAPABILITIES` arguments to specify the context information. The `-f FEATURES` argument used to describe the application features. The `-c CAPABILITIES` argument used to describe the capabilities required by application explicitly. The behavior data is passed by the `-m BEHAVIOR_DATA` argument. It's an ArmorProfileModel object that is generated with the **[BehaviorModeling mode](policies_and_rules/policy_modes/behavior_modeling.md)**.
+Please use the `-f FEATURES` and `-c CAPABILITIES` arguments to specify the context information. The `-f FEATURES` argument used to describe the application features. The `-c CAPABILITIES` argument used to describe the capabilities required by application explicitly. The behavior data is passed by the `-m BEHAVIOR_DATA` argument. It's an ArmorProfileModel object that is generated with the **[BehaviorModeling mode](../policies_and_rules/policy_modes/behavior_modeling.md)**.
 
 
 ## Use cases
@@ -18,6 +18,8 @@ Generate a policy template that runs in EnhanceProtect mode with built-in rules 
 Filter out the conflicted built-in rules with behavior data to make the policy template more precise.
 
 `policy-advisor.py AppArmor,BPF -f share-containers-pid-ns -c sys_admin,net_admin,kill -m data.json`
+
+> When matching behavior data against rules such as `disable-shell`, the advisor keys off both the executable basename and its file-extension token. So a shell recorded only as a script path (e.g. `/var/lib/cilium/bpf/init.sh`, with no `sh`/`bash`/`dash` binary) is still detected as a conflict via its `.sh` extension, and the conflicting rule is filtered out.
 
 
 ## Usage

@@ -150,7 +150,7 @@ const config = {
         },
         items: [
           {
-            to: 'index.html', 
+            to: '/',
             label: 'About', 
             position: 'right'
           },
@@ -198,6 +198,12 @@ const config = {
             title: 'More',
             items: [
               {
+                label: 'AI documentation (llms.txt)',
+                href: '/llms.txt',
+                // Force a document load for this generated text file, not SPA routing.
+                target: '_top',
+              },
+              {
                 label: 'GitHub',
                 href: 'https://github.com/bytedance/vArmor',
               },
@@ -212,6 +218,17 @@ const config = {
       },
     }),
     plugins: [
+      require.resolve('./plugins/unicode-ssr/index.cjs'),
+      require.resolve('./plugins/llms/index.cjs'),
+      // Render the downloadable tutorial YAML directly, without a second copy.
+      function exampleSources() {
+        return {
+          name: 'example-sources',
+          configureWebpack() {
+            return {module: {rules: [{test: /\.yaml$/, resourceQuery: /raw/, type: 'asset/source'}]}};
+          },
+        };
+      },
       [
         'vercel-analytics',
         {

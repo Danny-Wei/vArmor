@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	appsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
 
 	varmor "github.com/bytedance/vArmor/apis/varmor/v1beta1"
 	varmorconfig "github.com/bytedance/vArmor/internal/config"
@@ -96,6 +97,10 @@ ${IPT6} -t filter -A OUTPUT -p tcp --dport ${ENVOY_ADMIN_PORT} -m owner ! --uid-
 		Name:  "varmor-network-proxy-init",
 		Image: varmorconfig.ProxyInitImage,
 		SecurityContext: &coreV1.SecurityContext{
+			// iptables initialization must not inherit the application's UID
+			// or Pod-level non-root requirement.
+			RunAsUser:    ptr.To(int64(0)),
+			RunAsNonRoot: ptr.To(false),
 			Capabilities: &coreV1.Capabilities{
 				Add: []coreV1.Capability{"NET_ADMIN"},
 			},
@@ -110,9 +115,14 @@ ${IPT6} -t filter -A OUTPUT -p tcp --dport ${ENVOY_ADMIN_PORT} -m owner ! --uid-
 	}
 
 	proxyContainer = coreV1.Container{
-		Name:            "varmor-network-proxy",
-		Image:           varmorconfig.ProxyImage,
-		SecurityContext: &coreV1.SecurityContext{}, // Set RunAsUser with proxyUID
+		Name:  "varmor-network-proxy",
+		Image: varmorconfig.ProxyImage,
+		// Start as root for entrypoint preparation, then drop to proxyUID
+		// through VARMOR_ENVOY_UID. Override Pod-level non-root defaults.
+		SecurityContext: &coreV1.SecurityContext{
+			RunAsUser:    ptr.To(int64(0)),
+			RunAsNonRoot: ptr.To(false),
+		},
 		// The "--config-yaml" overlay carries the Pod identity into
 		// node.metadata. Its $(POD_*) references are expanded by the kubelet
 		// from the sidecar's Downward API env vars before Envoy starts, then
@@ -164,6 +174,8 @@ ${IPT6} -t filter -A OUTPUT -p tcp --dport ${ENVOY_ADMIN_PORT} -m owner ! --uid-
 			Secret: &coreV1.SecretVolumeSource{
 				// Name set per-policy at runtime.
 				Items: []coreV1.KeyToPath{
+					{Key: "mitm-cert-sds.yaml", Path: "mitm-cert-sds.yaml"},
+					{Key: "mitm-validation-sds.yaml", Path: "mitm-validation-sds.yaml"},
 					{Key: "mitm-leaf.crt", Path: "leaf.crt"},
 					{Key: "mitm-leaf.key", Path: "leaf.key"},
 					{Key: "mitm-ca-bundle.crt", Path: "ca-bundle.crt"},
@@ -302,6 +314,7 @@ var auditSinkEnvNames = map[string]bool{
 	"POLICY_KIND":          true,
 	"POLICY_NAME":          true,
 	"POLICY_NAMESPACE":     true,
+	"VARMOR_NAMESPACE":     true,
 	"VARMOR_ENVOY_UID":     true,
 	"AUDIT_EVENT_METADATA": true,
 }
@@ -314,6 +327,7 @@ var auditSinkEnvNames = map[string]bool{
 //   - NODE_NAME (Downward API spec.nodeName): node attribution.
 //   - PROFILE_NAME / POLICY_KIND / POLICY_NAME / POLICY_NAMESPACE: the policy
 //     identity the sink seeds so violation records carry the owning policy.
+//   - VARMOR_NAMESPACE: the namespace where vArmor itself is installed.
 //   - VARMOR_ENVOY_UID: the uid the entrypoint drops to before exec-ing Envoy,
 //     kept in sync with the iptables uid-owner RETURN exemption (proxyUID).
 //   - AUDIT_EVENT_METADATA: the cluster metadata literal the manager carries,
@@ -326,6 +340,7 @@ func auditSinkEnvVars(profileName string, id AuditPolicyIdentity, proxyUID int64
 		{Name: "POLICY_KIND", Value: id.Kind},
 		{Name: "POLICY_NAME", Value: id.Name},
 		{Name: "POLICY_NAMESPACE", Value: id.Namespace},
+		{Name: "VARMOR_NAMESPACE", Value: varmorconfig.Namespace},
 		{Name: "VARMOR_ENVOY_UID", Value: strconv.FormatInt(proxyUID, 10)},
 	}
 	if md := os.Getenv("AUDIT_EVENT_METADATA"); md != "" {
@@ -334,9 +349,10 @@ func auditSinkEnvVars(profileName string, id AuditPolicyIdentity, proxyUID int64
 	return envs
 }
 
-// cleanupAuditFromSidecar removes the ALS socket volumeMount and the three
-// Downward API env vars from the Envoy sidecar container if present, keeping
-// reconciliation idempotent when the NetworkProxy enforcer is removed.
+// cleanupAuditFromSidecar removes the ALS socket volumeMount, the Downward API
+// env vars, and all in-sidecar audit sink env vars from the Envoy sidecar if
+// present, keeping reconciliation idempotent when the NetworkProxy enforcer is
+// removed.
 func cleanupAuditFromSidecar(containers []coreV1.Container) {
 	for i := range containers {
 		if containers[i].Name != proxyContainer.Name {
@@ -661,8 +677,6 @@ func modifyDeploymentAnnotationsAndEnv(
 			// bind the in-sidecar audit sink before dropping to the Envoy uid
 			// (VARMOR_ENVOY_UID = proxyUID) and exec-ing Envoy. On runc this is
 			// harmless: the entrypoint drops to proxyUID immediately.
-			sidecarRunAsUser := int64(0)
-			proxyContainer.SecurityContext.RunAsUser = &sidecarRunAsUser
 			proxyContainer.ReadinessProbe.TCPSocket.Port.IntVal = int32(proxyPort)
 			proxyContainer.Resources = ResolveProxyResources(
 				proxyResourceOverride(proxyConfig), isMITMEnabled(proxyConfig))
@@ -891,8 +905,6 @@ func modifyStatefulSetAnnotationsAndEnv(
 			// bind the in-sidecar audit sink before dropping to the Envoy uid
 			// (VARMOR_ENVOY_UID = proxyUID) and exec-ing Envoy. On runc this is
 			// harmless: the entrypoint drops to proxyUID immediately.
-			sidecarRunAsUser := int64(0)
-			proxyContainer.SecurityContext.RunAsUser = &sidecarRunAsUser
 			proxyContainer.ReadinessProbe.TCPSocket.Port.IntVal = int32(proxyPort)
 			proxyContainer.Resources = ResolveProxyResources(
 				proxyResourceOverride(proxyConfig), isMITMEnabled(proxyConfig))
@@ -1121,8 +1133,6 @@ func modifyDaemonSetAnnotationsAndEnv(
 			// bind the in-sidecar audit sink before dropping to the Envoy uid
 			// (VARMOR_ENVOY_UID = proxyUID) and exec-ing Envoy. On runc this is
 			// harmless: the entrypoint drops to proxyUID immediately.
-			sidecarRunAsUser := int64(0)
-			proxyContainer.SecurityContext.RunAsUser = &sidecarRunAsUser
 			proxyContainer.ReadinessProbe.TCPSocket.Port.IntVal = int32(proxyPort)
 			proxyContainer.Resources = ResolveProxyResources(
 				proxyResourceOverride(proxyConfig), isMITMEnabled(proxyConfig))

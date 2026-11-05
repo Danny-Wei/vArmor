@@ -21,6 +21,7 @@ import (
 
 	varmor "github.com/bytedance/vArmor/apis/varmor/v1beta1"
 	varmorconfig "github.com/bytedance/vArmor/internal/config"
+	networkprofile "github.com/bytedance/vArmor/internal/networkproxy/profile"
 	varmorprofile "github.com/bytedance/vArmor/internal/profile"
 	varmortypes "github.com/bytedance/vArmor/internal/types"
 )
@@ -57,6 +58,10 @@ func ValidateAddPolicy(policy interface{}, behaviorModelingEnabled bool) (bool, 
 		clusterScope = true
 	default:
 		return false, "The policy type is not supported."
+	}
+
+	if enforcers == varmortypes.Unknown {
+		return false, "The enforcer field contains an unsupported or malformed value."
 	}
 
 	// Validate target workload kind - only supported Kubernetes resource types are allowed
@@ -116,9 +121,9 @@ func ValidateAddPolicy(policy interface{}, behaviorModelingEnabled bool) (bool, 
 		if ok, msg := validateProxyResources(spec.Policy.NetworkProxyConfig.Resources); !ok {
 			return false, msg
 		}
-		if spec.Policy.NetworkProxyConfig.ProxyPort != nil &&
-			spec.Policy.NetworkProxyConfig.ProxyAdminPort != nil &&
-			*spec.Policy.NetworkProxyConfig.ProxyPort == *spec.Policy.NetworkProxyConfig.ProxyAdminPort {
+		// Omitted fields still bind their runtime default ports.
+		_, proxyPort, proxyAdminPort := normalizedProxyConfigImmutableFields(spec.Policy.NetworkProxyConfig)
+		if proxyPort == proxyAdminPort {
 			return false, "proxyPort and proxyAdminPort must be different"
 		}
 	}
@@ -175,6 +180,10 @@ func ValidateUpdatePolicy(policy interface{}, oldEnforcer string, oldTarget varm
 		return false, "The policy type is not supported."
 	}
 
+	if newEnforcers == varmortypes.Unknown {
+		return false, "The enforcer field contains an unsupported or malformed value."
+	}
+
 	oldEnforcers := varmortypes.GetEnforcerType(oldEnforcer)
 
 	// Disallow modifying the target field of a policy.
@@ -188,9 +197,8 @@ func ValidateUpdatePolicy(policy interface{}, oldEnforcer string, oldTarget varm
 	// hot-reloaded. Changing them would cause a mismatch between the iptables REDIRECT
 	// target and the Envoy listener port in existing Pods.
 	// When oldProxyConfig is nil (controller path), this check is skipped.
-	if oldProxyConfig != nil && newSpec.Policy.NetworkProxyConfig != nil {
-		newPC := newSpec.Policy.NetworkProxyConfig
-		if !proxyConfigImmutableFieldsEqual(oldProxyConfig, newPC) {
+	if oldProxyConfig != nil {
+		if !proxyConfigImmutableFieldsEqual(oldProxyConfig, newSpec.Policy.NetworkProxyConfig) {
 			return false, "Modifying proxyUID, proxyPort, or proxyAdminPort is not allowed after the policy is created. You need to recreate the policy object."
 		}
 	}
@@ -209,9 +217,11 @@ func ValidateUpdatePolicy(policy interface{}, oldEnforcer string, oldTarget varm
 		return false, "Modifying the enforcer field of a policy is not allowed when behavior modeling is still incomplete."
 	}
 
-	// Disallow removing the activated AppArmor or Seccomp enforcer.
-	if (newEnforcers&oldEnforcers != oldEnforcers) && (newEnforcers|varmortypes.BPF != oldEnforcers) {
-		return false, "Modifying a policy to remove the AppArmor or Seccomp enforcer is not allowed. To remove them, you need to recreate the policy object."
+	// Only BPF supports safe dynamic removal; other enforcers require policy recreation.
+	removedEnforcers := oldEnforcers &^ newEnforcers
+	nonRemovableEnforcers := varmortypes.AppArmor | varmortypes.Seccomp | varmortypes.NetworkProxy
+	if removedEnforcers&nonRemovableEnforcers != 0 {
+		return false, "Modifying a policy to remove the AppArmor, Seccomp, or NetworkProxy enforcer is not allowed. To remove them, you need to recreate the policy object."
 	}
 
 	// Make sure the enhanceProtect field has been set when the policy runs in the EnhanceProtect mode.
@@ -254,9 +264,9 @@ func ValidateUpdatePolicy(policy interface{}, oldEnforcer string, oldTarget varm
 		if ok, msg := validateProxyResources(newSpec.Policy.NetworkProxyConfig.Resources); !ok {
 			return false, msg
 		}
-		if newSpec.Policy.NetworkProxyConfig.ProxyPort != nil &&
-			newSpec.Policy.NetworkProxyConfig.ProxyAdminPort != nil &&
-			*newSpec.Policy.NetworkProxyConfig.ProxyPort == *newSpec.Policy.NetworkProxyConfig.ProxyAdminPort {
+		// Omitted fields still bind their runtime default ports.
+		_, proxyPort, proxyAdminPort := normalizedProxyConfigImmutableFields(newSpec.Policy.NetworkProxyConfig)
+		if proxyPort == proxyAdminPort {
 			return false, "proxyPort and proxyAdminPort must be different"
 		}
 	}
@@ -269,12 +279,34 @@ func ValidateUpdatePolicy(policy interface{}, oldEnforcer string, oldTarget varm
 	return true, ""
 }
 
-// proxyConfigImmutableFieldsEqual compares the immutable fields of two
-// NetworkProxyConfig values. Returns true if they are equal or both nil.
+// proxyConfigImmutableFieldsEqual compares the effective immutable fields of
+// two NetworkProxyConfig values after applying their runtime defaults.
 func proxyConfigImmutableFieldsEqual(old, new *varmor.NetworkProxyConfig) bool {
-	return ptrInt64Equal(old.ProxyUID, new.ProxyUID) &&
-		ptrUint16Equal(old.ProxyPort, new.ProxyPort) &&
-		ptrUint16Equal(old.ProxyAdminPort, new.ProxyAdminPort)
+	oldProxyUID, oldProxyPort, oldProxyAdminPort := normalizedProxyConfigImmutableFields(old)
+	newProxyUID, newProxyPort, newProxyAdminPort := normalizedProxyConfigImmutableFields(new)
+
+	return oldProxyUID == newProxyUID &&
+		oldProxyPort == newProxyPort &&
+		oldProxyAdminPort == newProxyAdminPort
+}
+
+func normalizedProxyConfigImmutableFields(config *varmor.NetworkProxyConfig) (int64, uint16, uint16) {
+	proxyUID := varmorconfig.DefaultProxyUID
+	proxyPort := varmorconfig.DefaultProxyPort
+	proxyAdminPort := varmorconfig.DefaultProxyAdminPort
+	if config != nil {
+		if config.ProxyUID != nil {
+			proxyUID = *config.ProxyUID
+		}
+		if config.ProxyPort != nil {
+			proxyPort = *config.ProxyPort
+		}
+		if config.ProxyAdminPort != nil {
+			proxyAdminPort = *config.ProxyAdminPort
+		}
+	}
+
+	return proxyUID, proxyPort, proxyAdminPort
 }
 
 // validateNetworkProxyEgressForSpec validates NetworkProxy egress rules
@@ -295,26 +327,6 @@ func validateNetworkProxyEgressForSpec(spec *varmor.VarmorPolicySpec) (bool, str
 		}
 	}
 	return true, ""
-}
-
-func ptrInt64Equal(a, b *int64) bool {
-	if a == nil && b == nil {
-		return true
-	}
-	if a == nil || b == nil {
-		return false
-	}
-	return *a == *b
-}
-
-func ptrUint16Equal(a, b *uint16) bool {
-	if a == nil && b == nil {
-		return true
-	}
-	if a == nil || b == nil {
-		return false
-	}
-	return *a == *b
 }
 
 // containsYAMLUnsafeChars reports whether s contains any character that is
@@ -350,16 +362,26 @@ func validateMITMConfig(mitm *varmor.MITMConfig) (bool, string) {
 
 	domainSet := make(map[string]bool, len(mitm.Domains))
 	for i, d := range mitm.Domains {
+		if strings.TrimSpace(d) != d {
+			return false, fmt.Sprintf("mitm.domains[%d] %q: remove leading and trailing whitespace", i, d)
+		}
 		if ok, msg := validateNoYAMLUnsafeChars(fmt.Sprintf("mitm.domains[%d]", i), d); !ok {
 			return false, msg
 		}
 		domainSet[d] = true
 	}
 
+	if err := networkprofile.ValidateMITMDomains(mitm.Domains); err != nil {
+		return false, err.Error()
+	}
+
 	for i, hm := range mitm.HeaderMutations {
+		if strings.TrimSpace(hm.Domain) != hm.Domain {
+			return false, fmt.Sprintf("mitm.headerMutations[%d].domain %q: remove leading and trailing whitespace", i, hm.Domain)
+		}
 		if !domainSet[hm.Domain] {
 			return false, fmt.Sprintf(
-				"mitm.headerMutations[%d].domain %q is not in mitm.domains",
+				"mitm.headerMutations[%d].domain %q is not in mitm.domains; must exactly match an entry in mitm.domains (including case)",
 				i, hm.Domain)
 		}
 

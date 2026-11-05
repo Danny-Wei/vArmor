@@ -33,7 +33,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	varmor "github.com/bytedance/vArmor/apis/varmor/v1beta1"
-	varmorconfig "github.com/bytedance/vArmor/internal/config"
 )
 
 // ResolveMITMInput transforms a policy-side MITMConfig into the
@@ -45,8 +44,7 @@ import (
 //   - Drop HeaderMutation entries whose Domain is not present in
 //     MITMConfig.Domains (spec invariant: every mutation targets a
 //     declared MITM domain).
-//   - Leave the leaf cert/key paths at their varmorconfig defaults so the
-//     translator can reference them without another lookup.
+//   - Use the default SDS certificate path for the generated listener.
 //
 // Returns (nil, nil) when MITM is not configured on the policy. Returns a
 // disabled *MITMInput only if explicitly requested via an empty Domains
@@ -64,6 +62,9 @@ func ResolveMITMInput(
 		return nil, nil
 	}
 	cfg := npc.MITM
+	if err := ValidateMITMDomains(cfg.Domains); err != nil {
+		return nil, err
+	}
 
 	// Build a set of declared domains for O(1) lookup while resolving
 	// HeaderMutations. Any mutation targeting an undeclared domain is
@@ -100,8 +101,6 @@ func ResolveMITMInput(
 	return &MITMInput{
 		Domains:         append([]string(nil), cfg.Domains...),
 		HeadersByDomain: headersByDomain,
-		LeafCertPath:    varmorconfig.MITMLeafCertPath,
-		LeafKeyPath:     varmorconfig.MITMLeafKeyPath,
 	}, nil
 }
 
@@ -133,6 +132,11 @@ func resolveHeaderActionValue(
 	raw, ok := data[h.SecretRef.Key]
 	if !ok {
 		return "", fmt.Errorf("secret %s/%s has no key %q", namespace, h.SecretRef.Name, h.SecretRef.Key)
+	}
+	// Envoy skips empty header mutations, leaving client-supplied values intact.
+	// Reject them before publishing a profile that cannot enforce the overwrite.
+	if len(raw) == 0 {
+		return "", fmt.Errorf("secret %s/%s key %q must not be empty", namespace, h.SecretRef.Name, h.SecretRef.Key)
 	}
 	return string(raw), nil
 }

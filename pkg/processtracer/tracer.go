@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
@@ -32,8 +33,14 @@ type ProcessTracer struct {
 	execLink        link.Link
 	forkLink        link.Link
 	reader          *perf.Reader
+	chsMu           sync.RWMutex
 	processEventChs map[string]chan<- BpfProcessEvent
 	tracing         bool
+	closed          bool
+	resourcesClosed bool
+	startTracingFn  func() error
+	stopTracingFn   func() error
+	closeBpfObjsFn  func() error
 	log             logr.Logger
 }
 
@@ -68,46 +75,119 @@ func (tracer *ProcessTracer) init() error {
 }
 
 func (tracer *ProcessTracer) Close() {
+	tracer.chsMu.Lock()
+	defer tracer.chsMu.Unlock()
+
+	if tracer.resourcesClosed {
+		return
+	}
+	tracer.closed = true
+	clear(tracer.processEventChs)
+
 	tracer.log.Info("unload the bpf resources of tracer")
-	tracer.stopTracing()
-	tracer.bpfObjs.Close()
+	if tracer.tracing || tracer.reader != nil || tracer.execLink != nil || tracer.forkLink != nil {
+		if err := tracer.disableTracing(); err != nil {
+			tracer.log.Error(err, "failed to disable tracing")
+			return
+		}
+		tracer.tracing = false
+	}
+	if err := tracer.closeBpfObjects(); err != nil {
+		tracer.log.Error(err, "failed to unload the bpf resources of tracer")
+		return
+	}
+	tracer.resourcesClosed = true
 }
 
 func (tracer *ProcessTracer) AddProcessEventNotifyCh(subscriber string, processEventCh *chan BpfProcessEvent) {
-	if processEventCh != nil {
-		tracer.processEventChs[subscriber] = *processEventCh
-	}
+	tracer.chsMu.Lock()
+	defer tracer.chsMu.Unlock()
 
-	if len(tracer.processEventChs) == 1 {
-		err := tracer.startTracing()
+	if tracer.closed || processEventCh == nil {
+		return
+	}
+	tracer.processEventChs[subscriber] = *processEventCh
+
+	if !tracer.tracing {
+		err := tracer.enableTracing()
 		if err != nil {
 			tracer.log.Error(err, "failed to enable tracing")
+			return
 		}
 		tracer.tracing = true
 	}
 }
 
 func (tracer *ProcessTracer) DeleteProcessEventNotifyCh(subscriber string) {
+	tracer.chsMu.Lock()
+	defer tracer.chsMu.Unlock()
+
 	delete(tracer.processEventChs, subscriber)
 
 	if len(tracer.processEventChs) == 0 && tracer.tracing {
-		tracer.stopTracing()
+		err := tracer.disableTracing()
+		// Stopping can partially release the reader or links. Mark tracing
+		// inactive so the next subscriber retries startup and cleans up any
+		// stale resources first.
 		tracer.tracing = false
+		if err != nil {
+			tracer.log.Error(err, "failed to disable tracing")
+		}
 	}
 }
 
+func (tracer *ProcessTracer) enableTracing() error {
+	if tracer.startTracingFn != nil {
+		return tracer.startTracingFn()
+	}
+	return tracer.startTracing()
+}
+
+func (tracer *ProcessTracer) disableTracing() error {
+	if tracer.stopTracingFn != nil {
+		return tracer.stopTracingFn()
+	}
+	return tracer.stopTracing()
+}
+
+func (tracer *ProcessTracer) closeBpfObjects() error {
+	if tracer.closeBpfObjsFn != nil {
+		return tracer.closeBpfObjsFn()
+	}
+	return tracer.bpfObjs.Close()
+}
+
+func (tracer *ProcessTracer) snapshotProcessEventChs() []chan<- BpfProcessEvent {
+	tracer.chsMu.RLock()
+	defer tracer.chsMu.RUnlock()
+
+	chs := make([]chan<- BpfProcessEvent, 0, len(tracer.processEventChs))
+	for _, ch := range tracer.processEventChs {
+		chs = append(chs, ch)
+	}
+	return chs
+}
+
 func (tracer *ProcessTracer) startTracing() error {
+	if tracer.reader != nil || tracer.execLink != nil || tracer.forkLink != nil {
+		if err := tracer.stopTracing(); err != nil {
+			return fmt.Errorf("clean up stale tracing resources: %w", err)
+		}
+	}
+
 	err := tracer.attachBpfToTracepoint()
 	if err != nil {
-		return fmt.Errorf("attachBpfToTracepoint() failed: %v", err)
+		cleanupErr := tracer.unattachBpfToTracepoint()
+		return errors.Join(fmt.Errorf("attachBpfToTracepoint() failed: %w", err), cleanupErr)
 	}
 	err = tracer.createBpfEventsReader()
 	if err != nil {
-		return fmt.Errorf("createBpfEventsReader() failed: %v", err)
+		cleanupErr := tracer.unattachBpfToTracepoint()
+		return errors.Join(fmt.Errorf("createBpfEventsReader() failed: %w", err), cleanupErr)
 	}
 
 	// Handle bpf process events.
-	go tracer.handleBpfEvents()
+	go tracer.handleBpfEvents(tracer.reader)
 
 	tracer.log.Info("start tracing processes")
 
@@ -115,8 +195,13 @@ func (tracer *ProcessTracer) startTracing() error {
 }
 
 func (tracer *ProcessTracer) stopTracing() error {
-	tracer.closeBpfEventsReader()
-	tracer.unattachBpfToTracepoint()
+	err := errors.Join(
+		tracer.closeBpfEventsReader(),
+		tracer.unattachBpfToTracepoint(),
+	)
+	if err != nil {
+		return err
+	}
 
 	tracer.log.Info("stop tracing processes")
 	return nil
@@ -145,14 +230,24 @@ func (tracer *ProcessTracer) attachBpfToTracepoint() error {
 	return nil
 }
 
-func (tracer *ProcessTracer) unattachBpfToTracepoint() {
+func (tracer *ProcessTracer) unattachBpfToTracepoint() error {
+	var errs []error
 	if tracer.execLink != nil {
-		tracer.execLink.Close()
+		if err := tracer.execLink.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close exec tracepoint link: %w", err))
+		} else {
+			tracer.execLink = nil
+		}
 	}
 
 	if tracer.forkLink != nil {
-		tracer.forkLink.Close()
+		if err := tracer.forkLink.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close fork tracepoint link: %w", err))
+		} else {
+			tracer.forkLink = nil
+		}
 	}
+	return errors.Join(errs...)
 }
 
 // createBpfEventsReader open a perf event reader from kernel space on the BPF_MAP_TYPE_PERF_EVENT_ARRAY map.
@@ -165,16 +260,20 @@ func (tracer *ProcessTracer) createBpfEventsReader() error {
 	return nil
 }
 
-func (tracer *ProcessTracer) closeBpfEventsReader() {
+func (tracer *ProcessTracer) closeBpfEventsReader() error {
 	if tracer.reader != nil {
-		tracer.reader.Close()
+		if err := tracer.reader.Close(); err != nil {
+			return fmt.Errorf("close bpf events reader: %w", err)
+		}
+		tracer.reader = nil
 	}
+	return nil
 }
 
-func (tracer *ProcessTracer) handleBpfEvents() {
+func (tracer *ProcessTracer) handleBpfEvents(reader *perf.Reader) {
 	var event BpfProcessEvent
 	for {
-		record, err := tracer.reader.Read()
+		record, err := reader.Read()
 		if err != nil {
 			if errors.Is(err, perf.ErrClosed) {
 				tracer.log.V(2).Info("perf buffer reader is closed")
@@ -195,7 +294,7 @@ func (tracer *ProcessTracer) handleBpfEvents() {
 			continue
 		}
 
-		for _, eventCh := range tracer.processEventChs {
+		for _, eventCh := range tracer.snapshotProcessEventChs() {
 			eventCh <- event
 		}
 	}

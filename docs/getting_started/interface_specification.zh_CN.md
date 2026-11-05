@@ -215,14 +215,14 @@
 
 | 字段 | 描述 |
 |-----|------|
-|domains<br />*string array*|指定哪些 TLS 连接应被终止以进行 L7 检查。只有到这些域名的连接才会被解密；所有其他 TLS 流量原样通过。支持精确匹配（"api.openai.com"）和通配符（"*.openai.com"）。通配符匹配遵循 RFC 6125。|
-|headerMutations<br />*[HeaderMutation](#headermutation) array*|可选字段。逐域名的 HTTP 头部注入规则。每个条目的 domain 必须字面等于 `domains` 中的某一项（不执行通配符展开）。通常用于向特定上游服务的请求中注入 API 密钥或认证令牌，实现代理层的集中式凭证管理。|
+|domains<br />*string array*|指定哪些 TLS 连接应被终止以进行 L7 检查。只有到这些域名的连接才会被解密；所有其他 TLS 流量原样通过。支持精确匹配（"api.openai.com"）和通配符（"*.openai.com"）。通配符匹配遵循 RFC 6125。拒绝首尾空白以及等价的重复 MITM 身份。|
+|headerMutations<br />*[HeaderMutation](#headermutation) array*|可选字段。逐域名的 HTTP 头部注入规则。每个条目的 domain 必须与 `domains` 中的某一项完全一致，包括大小写（不展开通配符或 IP/CIDR 别名）。拒绝首尾空白。通常用于向特定上游服务的请求中注入 API 密钥或认证令牌，实现代理层的集中式凭证管理。|
 
 ### HeaderMutation
 
 | 字段 | 描述 |
 |-----|------|
-|domain<br />*string*|指定此变异应用于哪个 MITM 域名。必须字面等于 `MITMConfig.Domains` 中的某一项。|
+|domain<br />*string*|指定此变异应用于哪个 MITM 域名。必须与 `MITMConfig.Domains` 中的某一项完全一致，包括大小写。拒绝首尾空白。|
 |headers<br />*[HeaderAction](#headeraction) array*|要为此域名注入的头部列表。|
 
 ### HeaderAction
@@ -232,6 +232,8 @@
 |name<br />*string*|HTTP 头部名称（例如 "Authorization"、"x-api-key"）。|
 |value<br />*string*|可选字段。字面头部值。用于非敏感值。与 `secretRef` 互斥。|
 |secretRef<br />*[SecretKeyRef](#secretkeyref)*|可选字段。引用一个 Kubernetes Secret 键，该键包含头部值。用于 API 密钥或令牌等敏感值。被引用的 Secret 必须由用户在目标工作负载所在的同一命名空间中预先创建。控制器在 reconcile 时读取 Secret 值，并将其内联到 Envoy xDS 配置中。与 `value` 互斥。|
+
+SecretRef 引用值不能为空；非空内容保持原样。此校验在调和阶段执行，不在 admission 阶段执行。空值会使策略状态变为 Error、Ready=false；创建失败不在该 namespace 发布配置 Secret，更新失败保留该 namespace 上一份完整配置。集群策略不提供跨 namespace 原子更新。修正引用 Secret 后，需通过现有支持的策略更新入口重新触发调和；不会单独监听引用 Secret 的变化。
 
 ### SecretKeyRef
 
@@ -253,6 +255,8 @@
 |------|-------------|----------------|-----------|--------------|
 | 非 MITM | 50m | 64Mi | 500m | 256Mi |
 | MITM | 100m | 128Mi | 1000m | 512Mi |
+
+> 最终资源遵循三层、字段级的合并链：本策略级覆盖 > `varmor-config` ConfigMap 中设置的集群级默认值 > 上述内置默认值。集群级配置详见[NetworkProxy Sidecar 的默认资源](./installation.zh_CN.md#networkproxy-sidecar-的默认资源)。
 
 ## VarmorPolicyStatus
 
@@ -312,7 +316,7 @@
 |hosts<br />*string array*|可选字段。Hosts 指定要匹配的目标服务域名。支持精确匹配（"api.openai.com"）和通配符（"*.openai.com"）。多个值之间为逻辑“或”关系。|
 |ports<br />*[Port](#port) array*|可选字段。Ports 将规则限制为特定的目标端口。|
 |paths<br />*[HTTPPathMatch](#httppathmatch) array*|可选字段。Paths 指定 HTTP 请求路径匹配。对于 HTTPS 流量，路径匹配需要配置 MITM。|
-|methods<br />*string array*|可选字段。Methods 指定要匹配的 HTTP 方法（例如 GET、POST）。对于 HTTPS 流量，方法匹配需要配置 MITM。|
+|methods<br />*string array*|可选字段。Methods 指定要匹配的 HTTP 方法（例如 GET、POST）。对于 HTTPS 流量，方法匹配需要配置 MITM。值按原始大小写精确匹配，不自动转成大写；`GET`、`get`、`Get` 是不同的方法。升级前若用 `get` 表达标准 `GET`，请显式改为 `GET`。|
 
 ### HTTPPathMatch
 

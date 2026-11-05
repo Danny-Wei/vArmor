@@ -49,8 +49,7 @@ import (
 //
 // The MITM-prefixed keys are written only when the policy enables MITM.
 // They intentionally sit alongside the xDS keys in the same resource so
-// that a single kubelet volume sync keeps Envoy's watched_directory
-// consistent across LDS/CDS and tls_certificates updates.
+// that SDS-capable Pods can reload complete certificate/key pairs atomically.
 const (
 	// SecretKeyBootstrap is the Envoy bootstrap YAML consumed by the sidecar
 	// at startup. The path to this key is referenced by the sidecar
@@ -172,6 +171,12 @@ func checkSecretSize(secret *v1.Secret, logger logr.Logger) error {
 var envoyBootstrapTemplate = `node:
   id: varmor-network-proxy
   cluster: varmor-network-proxy
+layered_runtime:
+  layers:
+  - name: varmor_http_inspector
+    static_layer:
+      # Recognize custom HTTP methods before selecting HTTP versus TCP RBAC.
+      envoy.reloadable_features.http_inspector_use_balsa_parser: true
 admin:
   address:
     socket_address:
@@ -438,6 +443,12 @@ func GenerateEnvoySecret(kubeClient *kubernetes.Clientset, obj interface{}, name
 		if err != nil {
 			return nil, fmt.Errorf("prepare MITM material: %w", err)
 		}
+		certSDS, validationSDS, err := profile.GenerateTLSSecrets(material.Leaf.CertPEM, material.Leaf.KeyPEM, material.Bundle)
+		if err != nil {
+			return nil, fmt.Errorf("prepare TLS secrets: %w", err)
+		}
+		data[profile.MITMCertSDSFile] = string(certSDS)
+		data[profile.MITMValidationSDSFile] = string(validationSDS)
 		data[SecretKeyMITMCACert] = string(material.CA.CertPEM)
 		data[SecretKeyMITMCAKey] = string(material.CA.KeyPEM)
 		data[SecretKeyMITMLeafCert] = string(material.Leaf.CertPEM)
@@ -470,7 +481,7 @@ func GenerateEnvoySecret(kubeClient *kubernetes.Clientset, obj interface{}, name
 // would churn the CA bundle mounted into every target container, which
 // is the user-visible trust store. By pinning the CA across reconciles
 // we limit churn to the leaf material, which is only read by the Envoy
-// sidecar and can be hot-reloaded via Envoy's watched_directory.
+// sidecar and hot-reloaded through SDS on Pods using the new mount layout.
 func buildOrReuseMITMMaterial(kubeClient *kubernetes.Clientset, namespace, secretName string, domains []string) (*mitm.MITMMaterial, error) {
 	// Attempt to reuse an existing CA embedded in the policy's
 	// Secret. Any error other than "already carries a valid CA" is

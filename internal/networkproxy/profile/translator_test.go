@@ -338,19 +338,34 @@ func TestAuditOnlyRule(t *testing.T) {
 }
 
 func TestPortRange(t *testing.T) {
-	egress := &varmor.NetworkProxyEgress{
-		DefaultAction: "deny",
-		Rules: []varmor.NetworkProxyEgressRule{
-			{Qualifiers: []string{"allow"}, IP: "10.0.0.1", Ports: []varmor.Port{{Port: 8000, EndPort: 9000}}},
-		},
+	tests := []struct {
+		name      string
+		port      uint16
+		endPort   uint16
+		wantStart string
+		wantEnd   string
+	}{
+		{name: "regular range", port: 8000, endPort: 9000, wantStart: "start: 8000", wantEnd: "end: 9001"},
+		{name: "maximum port", port: 65534, endPort: 65535, wantStart: "start: 65534", wantEnd: "end: 65536"},
 	}
-	result, err := TranslateEgressRules(egress, 1, 15001, nil, testIPStack, AuditSinkConfig{})
-	if err != nil {
-		t.Fatalf("TranslateEgressRules failed: %v", err)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			egress := &varmor.NetworkProxyEgress{
+				DefaultAction: "deny",
+				Rules: []varmor.NetworkProxyEgressRule{
+					{Qualifiers: []string{"allow"}, IP: "10.0.0.1", Ports: []varmor.Port{{Port: tt.port, EndPort: tt.endPort}}},
+				},
+			}
+			result, err := TranslateEgressRules(egress, 1, 15001, nil, testIPStack, AuditSinkConfig{})
+			if err != nil {
+				t.Fatalf("TranslateEgressRules failed: %v", err)
+			}
+			assertContains(t, result.LDS, "destination_port_range:", "port range present")
+			assertContains(t, result.LDS, tt.wantStart, "port range start")
+			assertContains(t, result.LDS, tt.wantEnd, "port range end (exclusive)")
+		})
 	}
-	assertContains(t, result.LDS, "destination_port_range:", "port range present")
-	assertContains(t, result.LDS, "start: 8000", "port range start")
-	assertContains(t, result.LDS, "end: 9001", "port range end (exclusive)")
 }
 
 func TestWildcardDomain(t *testing.T) {
@@ -552,7 +567,7 @@ func TestHostPortMethodPathFullCombination(t *testing.T) {
 	assertContains(t, lds, "and_rules:", "all 4 dimensions ANDed")
 }
 
-func TestMethodCaseNormalization(t *testing.T) {
+func TestMethodCasePreservation(t *testing.T) {
 	egress := &varmor.NetworkProxyEgress{
 		DefaultAction: "deny",
 		HTTPRules: []varmor.NetworkProxyHTTPRule{
@@ -569,8 +584,8 @@ func TestMethodCaseNormalization(t *testing.T) {
 		t.Fatalf("TranslateEgressRules failed: %v", err)
 	}
 
-	assertContains(t, result.LDS, `exact: "GET"`, "lowercase 'get' normalized to 'GET'")
-	assertContains(t, result.LDS, `exact: "POST"`, "mixed case 'Post' normalized to 'POST'")
+	assertContains(t, result.LDS, `exact: "get"`, "lowercase method preserved")
+	assertContains(t, result.LDS, `exact: "Post"`, "mixed-case method preserved")
 }
 
 func TestMethodPathDenyRule(t *testing.T) {
@@ -684,7 +699,7 @@ func TestCrossProductCount(t *testing.T) {
 //   HCM:      CEL on response.code_details (deny) + http.rbac metadata (shadow)
 //   tcp_proxy: NO access_log (all handled at listener/HCM level)
 //
-// No UAEX, no response_flag_filter, no metadata_filter, no or_filter anywhere.
+// No UAEX, response_flag_filter, or metadata_filter. OrFilter joins CEL children.
 // ============================================================================
 
 // TestDenyDefaultAutoAudit verifies that access_log is present when defaultAction=deny.
@@ -746,7 +761,7 @@ func TestDenyDefaultAllowNoAudit(t *testing.T) {
 }
 
 // TestDenyDefaultAllowWithAudit verifies that allow+audit adds shadow_rules in deny-default.
-// v4: HCM uses single CEL expression with deny OR shadow check.
+// v4: HCM uses OrFilter with independent deny and shadow CEL children.
 func TestDenyDefaultAllowWithAudit(t *testing.T) {
 	egress := &varmor.NetworkProxyEgress{
 		DefaultAction: "deny",
@@ -767,7 +782,7 @@ func TestDenyDefaultAllowWithAudit(t *testing.T) {
 	assertContains(t, lds, "10.0.0.1", "audit allow rule IP")
 	// access_log should be present (deny-default)
 	assertContains(t, lds, "access_log", "access_log present")
-	// v4: single CEL expression combining deny + shadow check in HCM
+	// v4: OrFilter combining independent deny and shadow checks in HCM
 	assertContains(t, lds, "extension_filter", "CEL extension_filter")
 	assertContains(t, lds, "rbac_access_denied", "CEL deny detection")
 	assertContains(t, lds, "shadow_effective_policy_id", "CEL shadow detection")
@@ -777,7 +792,7 @@ func TestDenyDefaultAllowWithAudit(t *testing.T) {
 	assertContains(t, lds, "envoy.filters.network.rbac", "network RBAC namespace in CEL")
 	// No legacy filters
 	assertNotContains(t, lds, "UAEX", "no UAEX in v4")
-	assertNotContains(t, lds, "or_filter", "no or_filter in v4")
+	assertContains(t, lds, "or_filter", "independent deny/shadow OR filter")
 	assertNotContains(t, lds, "metadata_filter", "no metadata_filter in v4")
 	assertNotContains(t, lds, "response_flag_filter", "no response_flag_filter in v4")
 }
@@ -864,7 +879,7 @@ func TestAllowDefaultDenyWithAudit(t *testing.T) {
 	assertContains(t, lds, "shadow_effective_policy_id", "CEL checks shadow_effective_policy_id")
 	// No legacy filters
 	assertNotContains(t, lds, "UAEX", "no UAEX for allow-default")
-	assertNotContains(t, lds, "or_filter", "no or_filter in v4")
+	assertNotContains(t, lds, "or_filter", "single audit condition needs no OR filter")
 	assertNotContains(t, lds, "metadata_filter", "no metadata_filter in v4")
 	assertNotContains(t, lds, "response_flag_filter", "no response_flag_filter in v4")
 }
@@ -1047,7 +1062,7 @@ func TestClassifyRuleFunction(t *testing.T) {
 // ============================================================================
 
 // TestDenyDefaultFilterStructure verifies that deny-default with shadow_rules uses
-// a single CEL expression combining deny+shadow check in HCM access_log.
+// an OrFilter combining independent deny and shadow CEL checks in HCM access_log.
 func TestDenyDefaultFilterStructure(t *testing.T) {
 	egress := &varmor.NetworkProxyEgress{
 		DefaultAction: "deny",
@@ -1069,7 +1084,7 @@ func TestDenyDefaultFilterStructure(t *testing.T) {
 	assertContains(t, lds, "envoy.filters.network.rbac", "network rbac namespace in listener CEL")
 	assertContains(t, lds, "connection.termination_details", "listener CEL for deny detection")
 	// No legacy filters
-	assertNotContains(t, lds, "or_filter", "no or_filter in v4")
+	assertContains(t, lds, "or_filter", "independent deny/shadow OR filter")
 	assertNotContains(t, lds, "metadata_filter", "no metadata_filter in v4")
 	assertNotContains(t, lds, "UAEX", "no UAEX in v4")
 	assertNotContains(t, lds, "response_flag_filter", "no response_flag_filter in v4")
@@ -1095,7 +1110,7 @@ func TestAllowDefaultFilterStructure(t *testing.T) {
 	assertContains(t, lds, "shadow_effective_policy_id", "CEL shadow check")
 	// No legacy filters
 	assertNotContains(t, lds, "UAEX", "no UAEX for allow-default")
-	assertNotContains(t, lds, "or_filter", "no or_filter in v4")
+	assertNotContains(t, lds, "or_filter", "single audit condition needs no OR filter")
 	assertNotContains(t, lds, "response_flag_filter", "no response_flag_filter in v4")
 	assertNotContains(t, lds, "metadata_filter", "no metadata_filter in v4")
 }
@@ -1163,7 +1178,7 @@ func TestDenyDefaultNoShadowCELDenyOnly(t *testing.T) {
 	assertNotContains(t, lds, "UAEX", "no UAEX in v4")
 	assertNotContains(t, lds, "response_flag_filter", "no response_flag_filter in v4")
 	assertNotContains(t, lds, "metadata_filter", "no metadata_filter in v4")
-	assertNotContains(t, lds, "or_filter", "no or_filter in v4")
+	assertNotContains(t, lds, "or_filter", "single audit condition needs no OR filter")
 	// No tcp_proxy access_log
 	assertNotContains(t, lds, "TCP dst=", "no tcp_proxy access_log in v4")
 }
@@ -1241,7 +1256,7 @@ func TestFullSemanticMatrixDenyDefault(t *testing.T) {
 
 	// No legacy filters
 	assertNotContains(t, lds, "UAEX", "no UAEX in v4")
-	assertNotContains(t, lds, "or_filter", "no or_filter in v4")
+	assertContains(t, lds, "or_filter", "independent deny/shadow OR filter")
 	assertNotContains(t, lds, "metadata_filter", "no metadata_filter in v4")
 }
 
@@ -1288,7 +1303,7 @@ func TestFullSemanticMatrixAllowDefault(t *testing.T) {
 	assertContains(t, lds, "shadow_effective_policy_id", "CEL shadow check")
 	// No legacy filters
 	assertNotContains(t, lds, "UAEX", "no UAEX for allow-default")
-	assertNotContains(t, lds, "or_filter", "no or_filter in v4")
+	assertNotContains(t, lds, "or_filter", "single audit condition needs no OR filter")
 	assertNotContains(t, lds, "metadata_filter", "no metadata_filter in v4")
 }
 
@@ -1476,8 +1491,8 @@ func TestListenerAccessLogDenyDefaultWithShadow(t *testing.T) {
 	if strings.Contains(listenerSection, "UAEX") {
 		t.Fatal("REGRESSION: listener-level MUST NOT use UAEX")
 	}
-	if strings.Contains(listenerSection, "or_filter") {
-		t.Fatal("listener-level should NOT use or_filter (single CEL expression instead)")
+	if !strings.Contains(listenerSection, "or_filter") {
+		t.Fatal("listener-level should use or_filter for independent deny/shadow evaluation")
 	}
 	if strings.Contains(listenerSection, "metadata_filter") {
 		t.Fatal("listener-level should NOT use metadata_filter")
@@ -1540,7 +1555,7 @@ func TestDenyDefaultNoShadowHCMOnlyCEL(t *testing.T) {
 	assertNotContains(t, lds, "UAEX", "no UAEX in v4")
 	assertNotContains(t, lds, "response_flag_filter", "no response_flag_filter in v4")
 	assertNotContains(t, lds, "metadata_filter", "no metadata_filter in v4")
-	assertNotContains(t, lds, "or_filter", "no or_filter in v4")
+	assertNotContains(t, lds, "or_filter", "single audit condition needs no OR filter")
 	// No tcp_proxy access_log
 	assertNotContains(t, lds, "TCP dst=", "no tcp_proxy access_log in v4")
 }
@@ -1564,14 +1579,14 @@ func TestDenyDefaultWithShadowHCMCELDenyOrShadow(t *testing.T) {
 	// shadow_rules present
 	assertContains(t, lds, "shadow_rules", "shadow_rules for allow+audit")
 
-	// v4: single CEL expression with deny + shadow (not or_filter)
+	// v4: OrFilter with independent deny and shadow CEL checks
 	assertContains(t, lds, "extension_filter", "CEL extension_filter")
 	assertContains(t, lds, "rbac_access_denied", "CEL deny detection")
 	assertContains(t, lds, "shadow_effective_policy_id", "CEL shadow detection")
 	assertContains(t, lds, "connection.termination_details", "listener CEL deny check")
 
 	// No legacy filters
-	assertNotContains(t, lds, "or_filter", "no or_filter in v4")
+	assertContains(t, lds, "or_filter", "independent deny/shadow OR filter")
 	assertNotContains(t, lds, "metadata_filter", "no metadata_filter in v4")
 	assertNotContains(t, lds, "UAEX", "no UAEX in v4")
 
@@ -1608,7 +1623,7 @@ func TestAllowDefaultWithShadowCELOnly(t *testing.T) {
 
 	// No deny detection in allow-default
 	assertNotContains(t, lds, "UAEX", "no UAEX for allow-default")
-	assertNotContains(t, lds, "or_filter", "no or_filter in v4")
+	assertNotContains(t, lds, "or_filter", "single audit condition needs no OR filter")
 	assertNotContains(t, lds, "metadata_filter", "no metadata_filter in v4")
 
 	// v4: listener-level SHOULD have access_log with CEL shadow (unlike v3)
